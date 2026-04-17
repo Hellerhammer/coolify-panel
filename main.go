@@ -242,14 +242,23 @@ func handleCoolifyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":     false,
+			"reason": fmt.Sprintf("http %d", resp.StatusCode),
+		})
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":     false,
-		"reason": fmt.Sprintf("http %d", resp.StatusCode),
-	})
+	// A 200 alone isn't enough — if COOLIFY_URL points at a public domain
+	// behind a forward-auth proxy, that proxy returns 200 with its login
+	// page. Require a JSON body as a minimal sanity check that we actually
+	// reached the Coolify API.
+	body, _ := io.ReadAll(resp.Body)
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") || !json.Valid(body) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "reason": "not coolify (auth proxy?)"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
