@@ -545,6 +545,7 @@ func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user) {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+	log.Printf("DEBUG: Coolify envs response for %s: %s", uuid, string(body))
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("coolify envs get failed for %s: %d %.200s", uuid, resp.StatusCode, string(body))
 		http.Error(w, "coolify error", http.StatusBadGateway)
