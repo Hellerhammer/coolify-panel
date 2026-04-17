@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Service Details - {{.Resource.Name}}</title>
+<link rel="icon" href="/favicon.ico" type="image/png">
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 680px; margin: 2rem auto; padding: 0 1rem; }
+  header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:1.5rem; }
+  h1 { font-size: 1.25rem; margin: 0; }
+  .user { opacity: .6; font-size: .9rem; }
+  .back-link { color: inherit; text-decoration: none; opacity: .7; font-size: .9rem; margin-bottom: 1rem; display: inline-block; }
+  .back-link:hover { opacity: 1; }
+  .card { border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+          border-radius: 10px; padding: 1.5rem; margin-bottom: 1.5rem; }
+  .card-head { display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom: 1rem; }
+  .name { font-weight: 600; font-size: 1.2rem; }
+  .kind { font-size:.75rem; opacity:.6; text-transform:uppercase; letter-spacing:.05em; }
+  .actions { display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom: 1.5rem; }
+  button { font: inherit; padding: .4rem .9rem; border-radius: 6px; border:1px solid currentColor;
+           background: transparent; cursor: pointer; }
+  button:hover:not(:disabled) { background: color-mix(in srgb, currentColor 10%, transparent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.danger { color: #c0392b; }
+  button.save-btn { font-size: 0.85rem; padding: 0.2rem 0.6rem; }
+  .status { display:flex; align-items:center; gap:.4rem; font-size:.9rem; opacity:.8; }
+  .status .dot { width:.7rem; height:.7rem; border-radius:50%;
+                 background: color-mix(in srgb, currentColor 40%, transparent); }
+  .status[data-status="running"] .dot { background: #22c55e; }
+  .status[data-status="exited"] .dot,
+  .status[data-status="stopped"] .dot,
+  .status[data-status="dead"] .dot { background: #ef4444; }
+  .status[data-status="restarting"] .dot,
+  .status[data-status="starting"] .dot,
+  .status[data-status="degraded"] .dot { background: #eab308; }
+  .section-title { font-size: 1rem; font-weight: 600; margin: 2rem 0 1rem; border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent); padding-bottom: 0.5rem; }
+  .env-list { display: flex; flex-direction: column; gap: 1rem; }
+  .env-item { display: flex; flex-direction: column; gap: 0.4rem; }
+  .env-label { font-size: 0.85rem; font-weight: 600; opacity: 0.7; }
+  .env-input-group { display: flex; gap: 0.5rem; }
+  .env-input { flex-grow: 1; font: inherit; padding: 0.4rem 0.6rem; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); background: transparent; }
+  .toast { position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+           padding: .6rem 1rem; border-radius: 6px; background: #333; color: #fff;
+           opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.err { background: #c0392b; }
+</style>
+</head>
+<body>
+<a href="/" class="back-link">← Dashboard</a>
+<header>
+  <h1>Service Details</h1>
+  <div class="header-right">
+    <span class="user">👤 {{.User.Name}}</span>
+  </div>
+</header>
+
+<div class="card" id="main-card" data-uuid="{{.Resource.UUID}}">
+  <div class="card-head">
+    <div>
+      <div class="name">{{.Resource.Name}}</div>
+      <div class="kind">{{.Resource.Kind}}</div>
+    </div>
+    <div class="status" data-status="unknown">
+      <span class="dot"></span><span class="status-label">…</span>
+    </div>
+  </div>
+  
+  <div class="actions">
+    {{range .Resource.Actions}}
+      <button
+        data-action="{{.}}"
+        {{if eq . "stop"}}class="danger"{{end}}
+      >{{.}}</button>
+    {{end}}
+  </div>
+
+  {{if .Resource.EditableEnvs}}
+  <div class="section-title">Environment Variables</div>
+  <div class="env-list" id="env-list">
+    {{range .Resource.EditableEnvs}}
+    <div class="env-item" data-key="{{.}}">
+      <div class="env-label">{{.}}</div>
+      <div class="env-input-group">
+        <input type="text" class="env-input" placeholder="Loading..." disabled>
+        <button class="save-btn" disabled>Save</button>
+      </div>
+    </div>
+    {{end}}
+  </div>
+  {{end}}
+
+  <div class="section-title">Future Features</div>
+  <p style="opacity: 0.6; font-size: 0.9rem;">Logs and more metrics coming soon...</p>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const uuid = "{{.Resource.UUID}}";
+const toast = document.getElementById('toast');
+function showToast(msg, err) {
+  toast.textContent = msg;
+  toast.classList.toggle('err', !!err);
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 3000);
+}
+
+// Action button logic
+document.querySelectorAll('button[data-action]').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const action = btn.dataset.action;
+    const name = "{{.Resource.Name}}";
+
+    if (action === 'stop' && !confirm(`Really stop "${name}"?`)) return;
+
+    const btns = document.querySelectorAll('.actions button');
+    btns.forEach(b => b.disabled = true);
+    const originalLabel = btn.textContent;
+    btn.textContent = '...';
+
+    try {
+      const fd = new FormData();
+      fd.append('uuid', uuid);
+      fd.append('action', action);
+      const res = await fetch('/action', { method: 'POST', body: fd });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        showToast('✓ ' + (data.message || action));
+        fastRefreshAfterAction();
+      } else {
+        showToast('✗ ' + (data.message || res.statusText), true);
+      }
+    } catch (e) {
+      showToast('✗ ' + e.message, true);
+    } finally {
+      btn.textContent = originalLabel;
+      btns.forEach(b => b.disabled = false);
+    }
+  });
+});
+
+// Environment variable logic
+async function loadEnvs() {
+  const envList = document.getElementById('env-list');
+  if (!envList) return;
+
+  try {
+    const r = await fetch('/envs?uuid=' + encodeURIComponent(uuid));
+    const data = await r.json().catch(() => ({}));
+    if (data.envs) {
+      data.envs.forEach(env => {
+        const item = envList.querySelector(`.env-item[data-key="${env.key}"]`);
+        if (item) {
+          const input = item.querySelector('.env-input');
+          const btn = item.querySelector('.save-btn');
+          input.value = env.value;
+          input.disabled = false;
+          input.placeholder = "";
+          btn.disabled = false;
+        }
+      });
+    }
+  } catch (e) {
+    console.error('Failed to load envs', e);
+  }
+}
+
+document.querySelectorAll('.save-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const item = btn.closest('.env-item');
+    const key = item.dataset.key;
+    const input = item.querySelector('.env-input');
+    const value = input.value;
+
+    btn.disabled = true;
+    input.disabled = true;
+    const originalLabel = btn.textContent;
+    btn.textContent = '...';
+
+    try {
+      const fd = new FormData();
+      fd.append('uuid', uuid);
+      fd.append('key', key);
+      fd.append('value', value);
+      const res = await fetch('/envs', { method: 'POST', body: fd });
+      if (res.ok) {
+        showToast(`✓ Saved ${key}`);
+      } else {
+        showToast(`✗ Failed to save ${key}`, true);
+      }
+    } catch (e) {
+      showToast('✗ ' + e.message, true);
+    } finally {
+      btn.textContent = originalLabel;
+      btn.disabled = false;
+      input.disabled = false;
+    }
+  });
+});
+
+// Status polling logic (reused from index.html)
+function bucket(status) {
+  const head = status.split(':')[0];
+  if (head === 'running' || head === 'degraded') return 'up';
+  if (head === 'starting' || head === 'restarting') return 'transitional';
+  if (head === 'exited' || head === 'stopped' || head === 'dead') return 'down';
+  return 'unknown';
+}
+
+function humanLabel(status) {
+  const [head, tail] = status.split(':');
+  const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+  if (head === 'running') return tail && tail !== 'healthy' ? cap(tail) : 'Healthy';
+  if (head === 'exited' || head === 'stopped' || head === 'dead') return 'Stopped';
+  if (head === 'restarting') return 'Restarting';
+  if (head === 'starting') return 'Starting';
+  if (head === 'degraded') return 'Degraded';
+  return 'Unknown';
+}
+
+function applyButtonVisibility(bucketName) {
+  document.querySelectorAll('.actions button[data-action]').forEach(btn => {
+    const a = btn.dataset.action;
+    let show = true, disable = false;
+    if (bucketName === 'up') {
+      show = (a === 'stop' || a === 'restart');
+    } else if (bucketName === 'down') {
+      show = (a === 'start');
+    } else if (bucketName === 'transitional') {
+      disable = true;
+    }
+    btn.style.display = show ? 'inline-block' : 'none';
+    btn.disabled = disable;
+  });
+}
+
+async function refreshStatus() {
+  const el = document.querySelector('.status');
+  try {
+    const r = await fetch('/status?uuid=' + encodeURIComponent(uuid));
+    const data = await r.json().catch(() => ({}));
+    const s = (data.status || 'unknown').toLowerCase();
+    el.dataset.status = s.split(':')[0];
+    el.querySelector('.status-label').textContent = humanLabel(s);
+    applyButtonVisibility(bucket(s));
+  } catch {
+    el.dataset.status = 'unknown';
+    el.querySelector('.status-label').textContent = 'Unknown';
+    applyButtonVisibility('unknown');
+  }
+}
+
+let fastPollHandle = null;
+function fastRefreshAfterAction() {
+  if (fastPollHandle) clearInterval(fastPollHandle);
+  refreshStatus();
+  let attempts = 0;
+  fastPollHandle = setInterval(() => {
+    refreshStatus();
+    if (++attempts >= 8) {
+      clearInterval(fastPollHandle);
+      fastPollHandle = null;
+    }
+  }, 1500);
+}
+
+refreshStatus();
+loadEnvs();
+setInterval(refreshStatus, 10000);
+</script>
+</body>
+</html>

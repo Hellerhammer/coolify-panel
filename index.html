@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Service Panel</title>
+<link rel="icon" href="/favicon.ico" type="image/png">
 <style>
   :root { color-scheme: light dark; }
   body { font-family: system-ui, -apple-system, sans-serif; max-width: 680px; margin: 2rem auto; padding: 0 1rem; }
@@ -43,9 +44,10 @@
                          background: color-mix(in srgb, currentColor 40%, transparent); }
   .coolify-status[data-ok="true"] .dot { background: #22c55e; }
   .coolify-status[data-ok="false"] .dot { background: #ef4444; }
-  a.logout { color: inherit; opacity:.7; text-decoration: none; font-size:.85rem;
+  a.logout, a.details-btn { color: inherit; opacity:.7; text-decoration: none; font-size:.85rem;
              border:1px solid currentColor; padding:.25rem .6rem; border-radius:6px; }
-  a.logout:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
+  a.logout:hover, a.details-btn:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
+  a.details-btn { padding: .4rem .9rem; font-size: inherit; }
   button[hidden] { display: none; }
 </style>
 </head>
@@ -83,9 +85,11 @@
         {{if eq . "stop"}}class="danger"{{end}}
       >{{.}}</button>
     {{end}}
+    <a href="/details?uuid={{.UUID}}" class="details-btn">Details</a>
   </div>
 </div>
 {{end}}
+
 
 <div id="toast" class="toast"></div>
 

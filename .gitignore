@@ -20,4 +20,5 @@ config.yaml
 # Other
 *.sum
 CLAUDE.md
+GEMINI.md
 

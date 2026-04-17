@@ -17,7 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-//go:embed index.html
+//go:embed index.html details.html favicon.png
 var tmplFS embed.FS
 
 type ResourceKind string
@@ -29,12 +29,13 @@ const (
 )
 
 type Resource struct {
-	Name         string       `yaml:"name"`
-	UUID         string       `yaml:"uuid"`
-	Kind         ResourceKind `yaml:"kind"`            // "applications", "services", "databases"
-	AllowedUsers []string     `yaml:"allowed_users"`   // usernames from Remote-User
-	AllowedGroups []string    `yaml:"allowed_groups"`  // groups from Remote-Groups
-	Actions      []string     `yaml:"actions"`         // subset of: restart, start, stop
+	Name          string       `yaml:"name"`
+	UUID          string       `yaml:"uuid"`
+	Kind          ResourceKind `yaml:"kind"`           // "applications", "services", "databases"
+	AllowedUsers  []string     `yaml:"allowed_users"`  // usernames from Remote-User
+	AllowedGroups []string     `yaml:"allowed_groups"` // groups from Remote-Groups
+	Actions       []string     `yaml:"actions"`        // subset of: restart, start, stop
+	EditableEnvs  []string     `yaml:"editable_envs"`  // environment variables allowed to be edited
 }
 
 type Config struct {
@@ -50,11 +51,12 @@ type Config struct {
 }
 
 var (
-	cfg        Config
-	indexTmpl  *template.Template
-	rateLimit  = make(map[string]time.Time)
-	rateMu     sync.Mutex
-	rateWindow = 10 * time.Second
+	cfg         Config
+	indexTmpl   *template.Template
+	detailsTmpl *template.Template
+	rateLimit   = make(map[string]time.Time)
+	rateMu      sync.Mutex
+	rateWindow  = 10 * time.Second
 )
 
 func main() {
@@ -114,17 +116,32 @@ func main() {
 	}
 
 	indexTmpl = template.Must(template.ParseFS(tmplFS, "index.html"))
+	detailsTmpl = template.Must(template.ParseFS(tmplFS, "details.html"))
 
 	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/details", handleDetails)
 	http.HandleFunc("/action", handleAction)
 	http.HandleFunc("/status", handleStatus)
+	http.HandleFunc("/envs", handleEnvs)
 	http.HandleFunc("/coolify-status", handleCoolifyStatus)
+	http.HandleFunc("/favicon.ico", handleFavicon)
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 
 	addr := ":8080"
 	log.Printf("listening on %s (dev_mode=%v, %d resources, coolify_url=%s)", addr, cfg.DevMode, len(cfg.Resources), cfg.CoolifyURL)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
+
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	data, err := tmplFS.ReadFile("favicon.png")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Write(data)
+}
+
 
 type user struct {
 	Name   string
@@ -403,4 +420,158 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 		"ok":      false,
 		"message": fmt.Sprintf("Coolify error (%d)", resp.StatusCode),
 	})
+}
+
+func handleDetails(w http.ResponseWriter, r *http.Request) {
+	u, ok := getUser(r)
+	if !ok || u.Name == "" {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+	uuid := r.URL.Query().Get("uuid")
+	var res *Resource
+	for i := range cfg.Resources {
+		if cfg.Resources[i].UUID == uuid {
+			res = &cfg.Resources[i]
+			break
+		}
+	}
+	if res == nil || !userCanSee(u, *res) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	data := struct {
+		User      user
+		Resource  Resource
+		LogoutURL string
+	}{u, *res, cfg.LogoutURL}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := detailsTmpl.Execute(w, data); err != nil {
+		log.Printf("template error: %v", err)
+	}
+}
+
+func handleEnvs(w http.ResponseWriter, r *http.Request) {
+	u, ok := getUser(r)
+	if !ok || u.Name == "" {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		handleEnvsGet(w, r, u)
+	} else if r.Method == http.MethodPost {
+		handleEnvsPost(w, r, u)
+	} else {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user) {
+	uuid := r.URL.Query().Get("uuid")
+	var res *Resource
+	for i := range cfg.Resources {
+		if cfg.Resources[i].UUID == uuid {
+			res = &cfg.Resources[i]
+			break
+		}
+	}
+	if res == nil || !userCanSee(u, *res) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs", cfg.CoolifyURL, res.Kind, uuid)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "coolify unreachable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	var allEnvs []struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&allEnvs); err != nil {
+		http.Error(w, "failed to decode envs", http.StatusInternalServerError)
+		return
+	}
+
+	// Filter based on EditableEnvs
+	var filtered []map[string]string
+	for _, env := range allEnvs {
+		if slices.Contains(res.EditableEnvs, env.Key) {
+			filtered = append(filtered, map[string]string{
+				"key":   env.Key,
+				"value": env.Value,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"envs": filtered})
+}
+
+func handleEnvsPost(w http.ResponseWriter, r *http.Request, u user) {
+	uuid := r.FormValue("uuid")
+	key := r.FormValue("key")
+	value := r.FormValue("value")
+
+	var res *Resource
+	for i := range cfg.Resources {
+		if cfg.Resources[i].UUID == uuid {
+			res = &cfg.Resources[i]
+			break
+		}
+	}
+	if res == nil || !userCanSee(u, *res) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	if !slices.Contains(res.EditableEnvs, key) {
+		http.Error(w, "env var not editable", http.StatusForbidden)
+		return
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs", cfg.CoolifyURL, res.Kind, uuid)
+	payload, _ := json.Marshal(map[string]string{
+		"key":   key,
+		"value": value,
+	})
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPatch, endpoint, strings.NewReader(string(payload)))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "coolify unreachable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		http.Error(w, fmt.Sprintf("coolify error %d", resp.StatusCode), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
