@@ -552,29 +552,53 @@ func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user) {
 		return
 	}
 
-	var allEnvs []struct {
+	type envVar struct {
 		Key   string  `json:"key"`
 		Value *string `json:"value"`
 	}
+
+	var allEnvs []envVar
 	if err := json.Unmarshal(body, &allEnvs); err != nil {
 		// Some Coolify versions/resources might return a wrapper object
 		var wrapper struct {
-			Data []struct {
-				Key   string  `json:"key"`
-				Value *string `json:"value"`
-			} `json:"data"`
+			Data []envVar `json:"data"`
 		}
 		if err2 := json.Unmarshal(body, &wrapper); err2 == nil {
-			for _, e := range wrapper.Data {
-				allEnvs = append(allEnvs, struct {
-					Key   string  `json:"key"`
-					Value *string `json:"value"`
-				}{e.Key, e.Value})
-			}
+			allEnvs = wrapper.Data
 		} else {
 			log.Printf("failed to decode envs from %s: %v. Body: %.500s", uuid, err, string(body))
 			http.Error(w, "failed to decode envs", http.StatusInternalServerError)
 			return
+		}
+	}
+
+	// Fallback for Services: if values are missing, try fetching from the service detail endpoint
+	if res.Kind == KindService {
+		hasValues := false
+		for _, e := range allEnvs {
+			if e.Value != nil && *e.Value != "" {
+				hasValues = true
+				break
+			}
+		}
+
+		if !hasValues {
+			log.Printf("DEBUG: No values found in /envs for service %s, trying fallback to service detail", uuid)
+			serviceEndpoint := fmt.Sprintf("%s/api/v1/services/%s?decrypt=true", cfg.CoolifyURL, uuid)
+			req2, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, serviceEndpoint, nil)
+			req2.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
+			req2.Header.Set("Accept", "application/json")
+			resp2, err := client.Do(req2)
+			if err == nil && resp2.StatusCode == http.StatusOK {
+				defer resp2.Body.Close()
+				var serviceData struct {
+					EnvironmentVariables []envVar `json:"environment_variables"`
+				}
+				if err := json.NewDecoder(resp2.Body).Decode(&serviceData); err == nil && len(serviceData.EnvironmentVariables) > 0 {
+					log.Printf("DEBUG: Found %d envs in service detail fallback", len(serviceData.EnvironmentVariables))
+					allEnvs = serviceData.EnvironmentVariables
+				}
+			}
 		}
 	}
 
