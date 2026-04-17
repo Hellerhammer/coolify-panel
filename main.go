@@ -136,21 +136,13 @@ func main() {
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
-	// Active cookie clearing: This forces the browser to delete the local
-	// session cookies set by Authentik or Authelia.
-	cookieNames := []string{"authentik_proxy", "authelia_session"}
-	for _, name := range cookieNames {
-		http.SetCookie(w, &http.Cookie{
-			Name:     name,
-			Value:    "",
-			Path:     "/",
-			MaxAge:   -1,
-			HttpOnly: true,
-		})
-	}
-
+	// Forward-auth session cookies live on the auth proxy's domain
+	// (e.g. auth.domain.tld), not on the panel's. The browser won't let us
+	// clear them from here — only the proxy can. So this handler just
+	// redirects to the configured sign-out URL and lets the proxy do the
+	// actual invalidation.
 	if cfg.LogoutURL != "" {
-		log.Printf("logout: clearing cookies and redirecting to %s", cfg.LogoutURL)
+		log.Printf("logout -> %s", cfg.LogoutURL)
 		http.Redirect(w, r, cfg.LogoutURL, http.StatusFound)
 		return
 	}

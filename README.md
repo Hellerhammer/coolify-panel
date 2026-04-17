@@ -68,7 +68,52 @@ Easiest path: add the repo (or a zip) to Coolify as a Docker Compose application
 Set `COOLIFY_TOKEN` as a secret env var in Coolify's UI. Mount `config.yaml` as a
 persistent file, or commit it to the repo (just never with the token in it).
 
-### 6. Local testing (no auth)
+### 6. Logout with Authentik (forward-auth)
+
+The panel itself can't terminate an Authentik session — the session
+cookies are set on the Authentik domain (`auth.domain.tld`), not on the
+panel's domain, and browsers won't let one site clear another site's
+cookies. So the Logout button only redirects the user to Authentik's
+sign-out flow; Authentik does the actual invalidation.
+
+**1. Set `logout_url`** to Authentik's Invalidation Flow:
+
+```yaml
+logout_url: "https://auth.your-domain.com/flows/-/default/invalidation/"
+```
+
+Do *not* use `/application/o/<slug>/end-session/` — that's the OIDC
+end-session endpoint and doesn't exist for Proxy Providers.
+
+**2. Verify the Invalidation Flow.** In Authentik: **Flows & Stages →
+Flows → `default-invalidation-flow`**. It needs a `user_logout` stage
+(the default). Optionally create a custom flow that, after
+`user_logout`, has a **redirect** stage back to `https://panel.domain.tld`
+so the user lands somewhere useful instead of Authentik's generic
+"signed out" page.
+
+**3. Keep the Outpost's token validity short.** In Authentik: **Providers
+→ your Proxy Provider → Token validity**. If this is set to hours or
+days, the Outpost caches the auth decision that long, so a logged-out
+user would still be let through until the token expires. `minutes=5` or
+`minutes=15` is reasonable for a homelab.
+
+**4. Test.**
+
+- `curl -i https://panel.your-domain.com/logout` → expect `302` to
+  `logout_url`.
+- In a browser: log in, click **Logout** → you should land on Authentik's
+  sign-out page.
+- Reload `https://panel.your-domain.com` → you must see Authentik's
+  login prompt, not the panel.
+- Authentik Admin → **Events** → filter for `logout` — your event
+  should be there.
+
+If you get redirected straight back into the panel without having to log
+in again: the central Authentik session wasn't invalidated (wrong flow
+URL), or the Outpost's token cache hasn't expired yet.
+
+### 7. Local testing (no auth)
 
 ```bash
 COOLIFY_URL=https://your-coolify.com COOLIFY_TOKEN=xxx \
