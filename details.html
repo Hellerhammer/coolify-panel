@@ -24,6 +24,11 @@
   button:hover:not(:disabled) { background: color-mix(in srgb, currentColor 10%, transparent); }
   button:disabled { opacity: .5; cursor: not-allowed; }
   button.danger { color: #c0392b; }
+  .header-right { display:flex; align-items:center; gap:.9rem; }
+  a.logout, a.details-btn { color: inherit; opacity:.7; text-decoration: none; font-size:.85rem;
+             border:1px solid currentColor; padding:.25rem .6rem; border-radius:6px; }
+  a.logout:hover, a.details-btn:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
+  a.details-btn { padding: .4rem .9rem; font-size: inherit; }
   button.save-btn { font-size: 0.85rem; padding: 0.2rem 0.6rem; }
   .status { display:flex; align-items:center; gap:.4rem; font-size:.9rem; opacity:.8; }
   .status .dot { width:.7rem; height:.7rem; border-radius:50%;
@@ -54,6 +59,7 @@
   <h1>Service Details</h1>
   <div class="header-right">
     <span class="user">👤 {{.User.Name}}</span>
+    {{if .LogoutURL}}<a class="logout" href="{{.LogoutURL}}">Logout</a>{{end}}
   </div>
 </header>
 
@@ -89,6 +95,9 @@
       </div>
     </div>
     {{end}}
+  </div>
+  <div id="restart-warning" style="display: none; background: color-mix(in srgb, #eab308 15%, transparent); border: 1px solid #eab308; color: #eab308; padding: 0.8rem; border-radius: 6px; margin-top: 1rem; font-size: 0.9rem;">
+    ⚠️ <strong>Note:</strong> A restart is required for the changes to take effect.
   </div>
   {{end}}
 
@@ -129,6 +138,10 @@ document.querySelectorAll('button[data-action]').forEach(btn => {
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         showToast('✓ ' + (data.message || action));
+        if (action === 'restart' || action === 'start') {
+          const rw = document.getElementById('restart-warning');
+          if (rw) rw.style.display = 'none';
+        }
         fastRefreshAfterAction();
       } else {
         showToast('✗ ' + (data.message || res.statusText), true);
@@ -150,16 +163,21 @@ async function loadEnvs() {
   try {
     const r = await fetch('/envs?uuid=' + encodeURIComponent(uuid));
     const data = await r.json().catch(() => ({}));
+    
+    // Always enable all inputs so unset vars can be filled
+    envList.querySelectorAll('.env-item').forEach(item => {
+      const input = item.querySelector('.env-input');
+      const btn = item.querySelector('.save-btn');
+      input.disabled = false;
+      input.placeholder = "";
+      btn.disabled = false;
+    });
+
     if (data.envs) {
       data.envs.forEach(env => {
         const item = envList.querySelector(`.env-item[data-key="${env.key}"]`);
         if (item) {
-          const input = item.querySelector('.env-input');
-          const btn = item.querySelector('.save-btn');
-          input.value = env.value;
-          input.disabled = false;
-          input.placeholder = "";
-          btn.disabled = false;
+          item.querySelector('.env-input').value = env.value;
         }
       });
     }
@@ -188,6 +206,8 @@ document.querySelectorAll('.save-btn').forEach(btn => {
       const res = await fetch('/envs', { method: 'POST', body: fd });
       if (res.ok) {
         showToast(`✓ Saved ${key}`);
+        const rw = document.getElementById('restart-warning');
+        if (rw) rw.style.display = 'block';
       } else {
         showToast(`✗ Failed to save ${key}`, true);
       }
@@ -243,7 +263,14 @@ async function refreshStatus() {
     const r = await fetch('/status?uuid=' + encodeURIComponent(uuid));
     const data = await r.json().catch(() => ({}));
     const s = (data.status || 'unknown').toLowerCase();
-    el.dataset.status = s.split(':')[0];
+    
+    const newStatus = s.split(':')[0];
+    if (el.dataset.status !== newStatus && (newStatus === 'restarting' || newStatus === 'starting')) {
+      const rw = document.getElementById('restart-warning');
+      if (rw) rw.style.display = 'none';
+    }
+
+    el.dataset.status = newStatus;
     el.querySelector('.status-label').textContent = humanLabel(s);
     applyButtonVisibility(bucket(s));
   } catch {
