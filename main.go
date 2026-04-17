@@ -54,18 +54,31 @@ var (
 )
 
 func main() {
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "/config/config.yaml"
-	}
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		log.Fatalf("read config %s: %v", configPath, err)
+	// Config can come from two places:
+	//   1. The CONFIG_YAML env var (whole yaml contents as a string) — preferred
+	//      in container platforms like Coolify.
+	//   2. A file at CONFIG_PATH (defaults to /config/config.yaml) — useful for
+	//      local development or volume-mounted setups.
+	var data []byte
+	if inline := os.Getenv("CONFIG_YAML"); inline != "" {
+		data = []byte(inline)
+		log.Print("loading config from CONFIG_YAML env var")
+	} else {
+		configPath := os.Getenv("CONFIG_PATH")
+		if configPath == "" {
+			configPath = "/config/config.yaml"
+		}
+		var err error
+		data, err = os.ReadFile(configPath)
+		if err != nil {
+			log.Fatalf("read config %s: %v (set CONFIG_YAML env var or mount a config file)", configPath, err)
+		}
+		log.Printf("loading config from %s", configPath)
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("parse config: %v", err)
 	}
-	// Env overrides so you can keep the token out of the yaml file.
+	// Env overrides so you can keep the token out of the yaml.
 	if t := os.Getenv("COOLIFY_TOKEN"); t != "" {
 		cfg.CoolifyToken = t
 	}

@@ -7,10 +7,11 @@ services:
       # from the same Docker network that Coolify uses.
       COOLIFY_URL: "http://coolify:8080"
       COOLIFY_TOKEN: "${COOLIFY_TOKEN}"
-    # config.yaml is mounted via Coolify's File Storage feature
-    # (Application -> Storages -> File Mount -> /config/config.yaml),
-    # so it doesn't need to be in the repo.
+      # CONFIG_YAML holds the entire panel config as a multiline string.
+      # Set it in Coolify's Environment Variables UI (enable "Is Multiline").
+      CONFIG_YAML: "${CONFIG_YAML}"
     labels:
       # Attach Authentik forward-auth middleware (defined as dynamic config
       # in Coolify: Server -> Proxy -> Dynamic Configurations).
       - "coolify.traefik.middlewares=authentik-auth@file"
+ 
