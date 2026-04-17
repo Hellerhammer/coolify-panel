@@ -119,7 +119,7 @@ func main() {
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 
 	addr := ":8080"
-	log.Printf("listening on %s (dev_mode=%v, %d resources)", addr, cfg.DevMode, len(cfg.Resources))
+	log.Printf("listening on %s (dev_mode=%v, %d resources, coolify_url=%s)", addr, cfg.DevMode, len(cfg.Resources), cfg.CoolifyURL)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
@@ -391,7 +391,7 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	// TEMP: always log so we can verify actions are truly dispatched.
-	log.Printf("coolify action %s %s -> %d: %s", action, uuid, resp.StatusCode, string(body))
+	log.Printf("coolify action POST %s -> %d ct=%q body-head=%.200s", endpoint, resp.StatusCode, resp.Header.Get("Content-Type"), string(body))
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":      true,
