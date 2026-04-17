@@ -51,12 +51,14 @@ type Config struct {
 }
 
 var (
-	cfg         Config
-	indexTmpl   *template.Template
-	detailsTmpl *template.Template
-	rateLimit   = make(map[string]time.Time)
-	rateMu      sync.Mutex
-	rateWindow  = 10 * time.Second
+	cfg             Config
+	indexTmpl       *template.Template
+	detailsTmpl     *template.Template
+	rateLimit       = make(map[string]time.Time)
+	rateMu          sync.Mutex
+	rateWindow      = 10 * time.Second
+	restartRequired = make(map[string]bool)
+	restartMu       sync.Mutex
 )
 
 func main() {
@@ -340,7 +342,22 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"status": payload.Status})
+
+	s := strings.ToLower(payload.Status)
+	if strings.HasPrefix(s, "starting") || strings.HasPrefix(s, "restarting") {
+		restartMu.Lock()
+		delete(restartRequired, uuid)
+		restartMu.Unlock()
+	}
+
+	restartMu.Lock()
+	req := restartRequired[uuid]
+	restartMu.Unlock()
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":           payload.Status,
+		"restart_required": req,
+	})
 }
 
 func handleAction(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +425,11 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if action == "restart" || action == "start" {
+			restartMu.Lock()
+			delete(restartRequired, uuid)
+			restartMu.Unlock()
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":      true,
 			"message": fmt.Sprintf("%s: %s", action, res.Name),
@@ -498,22 +520,50 @@ func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user) {
 	}
 	defer resp.Body.Close()
 
-	var allEnvs []struct {
-		Key   string `json:"key"`
-		Value string `json:"value"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&allEnvs); err != nil {
-		http.Error(w, "failed to decode envs", http.StatusInternalServerError)
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("coolify envs get failed for %s: %d %.200s", uuid, resp.StatusCode, string(body))
+		http.Error(w, "coolify error", http.StatusBadGateway)
 		return
 	}
 
+	var allEnvs []struct {
+		Key   string  `json:"key"`
+		Value *string `json:"value"`
+	}
+	if err := json.Unmarshal(body, &allEnvs); err != nil {
+		// Some Coolify versions/resources might return a wrapper object
+		var wrapper struct {
+			Data []struct {
+				Key   string  `json:"key"`
+				Value *string `json:"value"`
+			} `json:"data"`
+		}
+		if err2 := json.Unmarshal(body, &wrapper); err2 == nil {
+			for _, e := range wrapper.Data {
+				allEnvs = append(allEnvs, struct {
+					Key   string  `json:"key"`
+					Value *string `json:"value"`
+				}{e.Key, e.Value})
+			}
+		} else {
+			log.Printf("failed to decode envs from %s: %v. Body: %.500s", uuid, err, string(body))
+			http.Error(w, "failed to decode envs", http.StatusInternalServerError)
+			return
+		}
+	}
+
 	// Filter based on EditableEnvs
-	var filtered []map[string]string
+	var filtered []map[string]any
 	for _, env := range allEnvs {
 		if slices.Contains(res.EditableEnvs, env.Key) {
-			filtered = append(filtered, map[string]string{
+			val := ""
+			if env.Value != nil {
+				val = *env.Value
+			}
+			filtered = append(filtered, map[string]any{
 				"key":   env.Key,
-				"value": env.Value,
+				"value": val,
 			})
 		}
 	}
@@ -545,9 +595,13 @@ func handleEnvsPost(w http.ResponseWriter, r *http.Request, u user) {
 	}
 
 	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs", cfg.CoolifyURL, res.Kind, uuid)
-	payload, _ := json.Marshal(map[string]string{
-		"key":   key,
-		"value": value,
+	// Sending is_literal: true and is_shown_on_frontend: true (where applicable)
+	// can help ensure values are stored as raw strings and returned in future calls.
+	payload, _ := json.Marshal(map[string]any{
+		"key":                  key,
+		"value":                value,
+		"is_literal":           true,
+		"is_shown_on_frontend": true,
 	})
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPatch, endpoint, strings.NewReader(string(payload)))
@@ -571,6 +625,10 @@ func handleEnvsPost(w http.ResponseWriter, r *http.Request, u user) {
 		http.Error(w, fmt.Sprintf("coolify error %d", resp.StatusCode), http.StatusBadGateway)
 		return
 	}
+
+	restartMu.Lock()
+	restartRequired[uuid] = true
+	restartMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})

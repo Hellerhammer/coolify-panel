@@ -85,6 +85,9 @@
 
   {{if .Resource.EditableEnvs}}
   <div class="section-title">Environment Variables</div>
+  <p style="opacity: 0.6; font-size: 0.85rem; margin-bottom: 1rem;">
+    Note: Some variables (like passwords) may appear empty if they are stored as secrets in Coolify.
+  </p>
   <div class="env-list" id="env-list">
     {{range .Resource.EditableEnvs}}
     <div class="env-item" data-key="{{.}}">
@@ -138,10 +141,6 @@ document.querySelectorAll('button[data-action]').forEach(btn => {
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         showToast('✓ ' + (data.message || action));
-        if (action === 'restart' || action === 'start') {
-          const rw = document.getElementById('restart-warning');
-          if (rw) rw.style.display = 'none';
-        }
         fastRefreshAfterAction();
       } else {
         showToast('✗ ' + (data.message || res.statusText), true);
@@ -265,14 +264,14 @@ async function refreshStatus() {
     const s = (data.status || 'unknown').toLowerCase();
     
     const newStatus = s.split(':')[0];
-    if (el.dataset.status !== newStatus && (newStatus === 'restarting' || newStatus === 'starting')) {
-      const rw = document.getElementById('restart-warning');
-      if (rw) rw.style.display = 'none';
-    }
-
     el.dataset.status = newStatus;
     el.querySelector('.status-label').textContent = humanLabel(s);
     applyButtonVisibility(bucket(s));
+
+    const rw = document.getElementById('restart-warning');
+    if (rw) {
+      rw.style.display = data.restart_required ? 'block' : 'none';
+    }
   } catch {
     el.dataset.status = 'unknown';
     el.querySelector('.status-label').textContent = 'Unknown';
