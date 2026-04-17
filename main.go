@@ -351,12 +351,12 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	restartMu.Lock()
-	req := restartRequired[uuid]
+	needsRestart := restartRequired[uuid]
 	restartMu.Unlock()
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":           payload.Status,
-		"restart_required": req,
+		"restart_required": needsRestart,
 	})
 }
 
