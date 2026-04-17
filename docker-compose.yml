@@ -1,0 +1,29 @@
+services:
+  panel:
+    build: .
+    # If you'd rather use a prebuilt image, deploy this repo in Coolify directly —
+    # Coolify will build the Dockerfile for you.
+    restart: unless-stopped
+    environment:
+      COOLIFY_URL: "http://coolify:8000"  # internal, via the coolify docker network
+      COOLIFY_TOKEN: "${COOLIFY_TOKEN}"   # from .env or Coolify secrets
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    networks:
+      - coolify       # so we can reach coolify internally
+      - proxy         # for traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.panel.rule=Host(`panel.your-domain.com`)"
+      - "traefik.http.routers.panel.entrypoints=https"
+      - "traefik.http.routers.panel.tls=true"
+      - "traefik.http.routers.panel.tls.certresolver=letsencrypt"
+      - "traefik.http.services.panel.loadbalancer.server.port=8080"
+      # Auth proxy middleware goes here:
+      - "traefik.http.routers.panel.middlewares=authelia@docker"
+
+networks:
+  coolify:
+    external: true
+  proxy:
+    external: true

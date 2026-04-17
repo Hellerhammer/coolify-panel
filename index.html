@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Service Panel</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 680px; margin: 2rem auto; padding: 0 1rem; }
+  header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:1.5rem; }
+  h1 { font-size: 1.25rem; margin: 0; }
+  .user { opacity: .6; font-size: .9rem; }
+  .card { border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+          border-radius: 10px; padding: 1rem; margin-bottom: .75rem; }
+  .card-head { display:flex; justify-content:space-between; align-items:center; gap:1rem; }
+  .name { font-weight: 600; }
+  .kind { font-size:.75rem; opacity:.6; text-transform:uppercase; letter-spacing:.05em; }
+  .actions { margin-top: .75rem; display:flex; gap:.5rem; flex-wrap:wrap; }
+  button { font: inherit; padding: .4rem .9rem; border-radius: 6px; border:1px solid currentColor;
+           background: transparent; cursor: pointer; }
+  button:hover:not(:disabled) { background: color-mix(in srgb, currentColor 10%, transparent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.danger { color: #c0392b; }
+  .toast { position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+           padding: .6rem 1rem; border-radius: 6px; background: #333; color: #fff;
+           opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.err { background: #c0392b; }
+  .empty { opacity: .6; text-align: center; padding: 2rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Service Panel</h1>
+  <span class="user">👤 {{.User.Name}}</span>
+</header>
+
+{{if not .Resources}}
+<p class="empty">No services available for you.</p>
+{{end}}
+
+{{range .Resources}}
+<div class="card" data-uuid="{{.UUID}}">
+  <div class="card-head">
+    <div>
+      <div class="name">{{.Name}}</div>
+      <div class="kind">{{.Kind}}</div>
+    </div>
+  </div>
+  <div class="actions">
+    {{range .Actions}}
+      <button
+        data-action="{{.}}"
+        {{if eq . "stop"}}class="danger"{{end}}
+      >{{.}}</button>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
+<div id="toast" class="toast"></div>
+
+<script>
+const toast = document.getElementById('toast');
+function showToast(msg, err) {
+  toast.textContent = msg;
+  toast.classList.toggle('err', !!err);
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 3000);
+}
+
+document.querySelectorAll('button[data-action]').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const card = btn.closest('.card');
+    const uuid = card.dataset.uuid;
+    const action = btn.dataset.action;
+    const name = card.querySelector('.name').textContent;
+
+    if (action === 'stop' && !confirm(`Really stop "${name}"?`)) return;
+
+    // Disable all buttons on this card while the request is in flight.
+    const cardBtns = card.querySelectorAll('button');
+    cardBtns.forEach(b => b.disabled = true);
+    const originalLabel = btn.textContent;
+    btn.textContent = '...';
+
+    try {
+      const fd = new FormData();
+      fd.append('uuid', uuid);
+      fd.append('action', action);
+      const res = await fetch('/action', { method: 'POST', body: fd });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        showToast('✓ ' + (data.message || action));
+      } else {
+        showToast('✗ ' + (data.message || res.statusText), true);
+      }
+    } catch (e) {
+      showToast('✗ ' + e.message, true);
+    } finally {
+      btn.textContent = originalLabel;
+      cardBtns.forEach(b => b.disabled = false);
+    }
+  });
+});
+</script>
+</body>
+</html>

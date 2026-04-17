@@ -1,0 +1,25 @@
+# Coolify API settings.
+# Better: don't put the token here — pass it via the COOLIFY_TOKEN env var.
+coolify_url: "http://coolify:8000"
+coolify_token: ""  # -> COOLIFY_TOKEN env var
+
+# dev_mode: true allows ?user=alice&groups=admins in the URL (for local testing only!)
+dev_mode: false
+
+# Resources that can be controlled. Anything in Coolify not listed here stays invisible.
+# kind: "applications" | "services" | "databases"
+# actions: subset of [restart, start, stop]
+resources:
+  - name: "Factorio Server"
+    uuid: "abc123-def456-ghi789"
+    kind: applications
+    allowed_users: ["alice"]
+    allowed_groups: ["gamers"]
+    actions: [restart, start, stop]
+
+  - name: "TeamSpeak 6"
+    uuid: "xxx-yyy-zzz"
+    kind: services
+    allowed_users: []
+    allowed_groups: ["gamers", "admins"]
+    actions: [restart]
