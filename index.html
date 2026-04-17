@@ -121,7 +121,7 @@ document.querySelectorAll('button[data-action]').forEach(btn => {
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         showToast('✓ ' + (data.message || action));
-        refreshStatus(card);
+        fastRefreshAfterAction(card);
       } else {
         showToast('✗ ' + (data.message || res.statusText), true);
       }
@@ -134,14 +134,25 @@ document.querySelectorAll('button[data-action]').forEach(btn => {
   });
 });
 
-// Coolify may return compound statuses like "running:healthy" — we only
-// care about the first token for bucketing.
+// Coolify returns compound statuses like "running:healthy". The first
+// token is the container state, the second (if present) is the healthcheck.
 function bucket(status) {
   const head = status.split(':')[0];
   if (head === 'running' || head === 'degraded') return 'up';
   if (head === 'starting' || head === 'restarting') return 'transitional';
   if (head === 'exited' || head === 'stopped' || head === 'dead') return 'down';
   return 'unknown';
+}
+
+function humanLabel(status) {
+  const [head, tail] = status.split(':');
+  const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+  if (head === 'running') return tail && tail !== 'healthy' ? cap(tail) : 'Healthy';
+  if (head === 'exited' || head === 'stopped' || head === 'dead') return 'Stopped';
+  if (head === 'restarting') return 'Restarting';
+  if (head === 'starting') return 'Starting';
+  if (head === 'degraded') return 'Degraded';
+  return 'Unknown';
 }
 
 function applyButtonVisibility(card, bucketName) {
@@ -169,16 +180,32 @@ async function refreshStatus(card) {
     const data = await r.json().catch(() => ({}));
     const s = (data.status || 'unknown').toLowerCase();
     el.dataset.status = s.split(':')[0];
-    el.querySelector('.status-label').textContent = s;
+    el.querySelector('.status-label').textContent = humanLabel(s);
     applyButtonVisibility(card, bucket(s));
   } catch {
     el.dataset.status = 'unknown';
-    el.querySelector('.status-label').textContent = 'unknown';
+    el.querySelector('.status-label').textContent = 'Unknown';
     applyButtonVisibility(card, 'unknown');
   }
 }
 function refreshAll() {
   document.querySelectorAll('.card').forEach(refreshStatus);
+}
+
+// Coolify's reported status lags a few seconds behind the actual action
+// (container needs to spin up/down). Poll fast for ~12s after a click so
+// the UI catches the transition, then fall back to the regular 10s cadence.
+function fastRefreshAfterAction(card) {
+  if (card._fastPollHandle) clearInterval(card._fastPollHandle);
+  refreshStatus(card);
+  let attempts = 0;
+  card._fastPollHandle = setInterval(() => {
+    refreshStatus(card);
+    if (++attempts >= 8) {
+      clearInterval(card._fastPollHandle);
+      card._fastPollHandle = null;
+    }
+  }, 1500);
 }
 
 async function refreshCoolifyStatus() {

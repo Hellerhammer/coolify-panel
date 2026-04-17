@@ -310,7 +310,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("coolify status %d for %s: %s", resp.StatusCode, uuid, string(body))
+		log.Printf("coolify status %d for %s: %.200s", resp.StatusCode, uuid, string(body))
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
 		return
@@ -320,9 +320,6 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil || payload.Status == "" {
-		// TEMP: surface the raw Coolify response so we can see which field
-		// actually holds the status. Remove once the shape is known.
-		log.Printf("status debug uuid=%s kind=%s body=%s", uuid, res.Kind, string(body))
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
 		return
 	}
@@ -393,8 +390,6 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(resp.Body)
 
 	w.Header().Set("Content-Type", "application/json")
-	// TEMP: always log so we can verify actions are truly dispatched.
-	log.Printf("coolify action POST %s -> %d ct=%q body-head=%.200s", endpoint, resp.StatusCode, resp.Header.Get("Content-Type"), string(body))
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":      true,
@@ -402,6 +397,7 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	log.Printf("coolify action %s %s -> %d: %.200s", action, uuid, resp.StatusCode, string(body))
 	w.WriteHeader(http.StatusBadGateway)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":      false,
