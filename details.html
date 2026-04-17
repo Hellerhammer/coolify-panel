@@ -59,7 +59,7 @@
   <h1>Service Details</h1>
   <div class="header-right">
     <span class="user">👤 {{.User.Name}}</span>
-    {{if .LogoutURL}}<a class="logout" href="{{.LogoutURL}}">Logout</a>{{end}}
+    {{if .LogoutURL}}<a class="logout" href="/logout">Logout</a>{{end}}
   </div>
 </header>
 
@@ -85,9 +85,7 @@
 
   {{if .Resource.EditableEnvs}}
   <div class="section-title">Environment Variables</div>
-  <p style="opacity: 0.6; font-size: 0.85rem; margin-bottom: 1rem;">
-    Note: Some variables (like passwords) may appear empty if they are stored as secrets in Coolify.
-  </p>
+
   <div class="env-list" id="env-list">
     {{range .Resource.EditableEnvs}}
     <div class="env-item" data-key="{{.}}">

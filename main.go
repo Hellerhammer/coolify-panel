@@ -121,6 +121,7 @@ func main() {
 	detailsTmpl = template.Must(template.ParseFS(tmplFS, "details.html"))
 
 	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/logout", handleLogout)
 	http.HandleFunc("/details", handleDetails)
 	http.HandleFunc("/action", handleAction)
 	http.HandleFunc("/status", handleStatus)
@@ -132,6 +133,15 @@ func main() {
 	addr := ":8080"
 	log.Printf("listening on %s (dev_mode=%v, %d resources, coolify_url=%s)", addr, cfg.DevMode, len(cfg.Resources), cfg.CoolifyURL)
 	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	if cfg.LogoutURL != "" {
+		log.Printf("logout: redirecting to %s", cfg.LogoutURL)
+		http.Redirect(w, r, cfg.LogoutURL, http.StatusFound)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func handleFavicon(w http.ResponseWriter, r *http.Request) {
@@ -214,6 +224,7 @@ func userCanSee(u user, res Resource) bool {
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
+		log.Printf("not found: %s", r.URL.Path)
 		http.NotFound(w, r)
 		return
 	}
@@ -503,7 +514,7 @@ func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user) {
 		return
 	}
 
-	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs", cfg.CoolifyURL, res.Kind, uuid)
+	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs?decrypt=true", cfg.CoolifyURL, res.Kind, uuid)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
