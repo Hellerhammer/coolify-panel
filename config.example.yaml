@@ -5,8 +5,9 @@ coolify_token: ""  # -> COOLIFY_TOKEN env var
 
 # Optional: URL the "Logout" button points to. Typically the forward-auth
 # proxy's sign-out endpoint. Leave empty (or omit) to hide the button.
-#   Authentik: "/outpost.goauthentik.io/sign_out?rd=/"
-#   Authelia:  "/logout"
+#   Authentik (Global): "https://auth.domain.tld/if/flow/default-invalidation-flow/"
+#   Authentik (App):    "https://auth.domain.tld/application/o/<slug>/end-session/"
+#   Authelia:           "/logout"
 logout_url: ""
 
 # dev_mode: true allows ?user=alice&groups=admins in the URL (for local testing only!)

@@ -121,6 +121,7 @@ func main() {
 	detailsTmpl = template.Must(template.ParseFS(tmplFS, "details.html"))
 
 	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/logout", handleLogout)
 	http.HandleFunc("/details", handleDetails)
 	http.HandleFunc("/action", handleAction)
 	http.HandleFunc("/status", handleStatus)
@@ -132,6 +133,28 @@ func main() {
 	addr := ":8080"
 	log.Printf("listening on %s (dev_mode=%v, %d resources, coolify_url=%s)", addr, cfg.DevMode, len(cfg.Resources), cfg.CoolifyURL)
 	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Active cookie clearing: This forces the browser to delete the local
+	// session cookies set by Authentik or Authelia.
+	cookieNames := []string{"authentik_proxy", "authelia_session"}
+	for _, name := range cookieNames {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+		})
+	}
+
+	if cfg.LogoutURL != "" {
+		log.Printf("logout: clearing cookies and redirecting to %s", cfg.LogoutURL)
+		http.Redirect(w, r, cfg.LogoutURL, http.StatusFound)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func handleFavicon(w http.ResponseWriter, r *http.Request) {
