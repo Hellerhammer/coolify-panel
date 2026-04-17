@@ -121,7 +121,6 @@ func main() {
 	detailsTmpl = template.Must(template.ParseFS(tmplFS, "details.html"))
 
 	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/logout", handleLogout)
 	http.HandleFunc("/details", handleDetails)
 	http.HandleFunc("/action", handleAction)
 	http.HandleFunc("/status", handleStatus)
@@ -133,15 +132,6 @@ func main() {
 	addr := ":8080"
 	log.Printf("listening on %s (dev_mode=%v, %d resources, coolify_url=%s)", addr, cfg.DevMode, len(cfg.Resources), cfg.CoolifyURL)
 	log.Fatal(http.ListenAndServe(addr, nil))
-}
-
-func handleLogout(w http.ResponseWriter, r *http.Request) {
-	if cfg.LogoutURL != "" {
-		log.Printf("logout: redirecting to %s", cfg.LogoutURL)
-		http.Redirect(w, r, cfg.LogoutURL, http.StatusFound)
-		return
-	}
-	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func handleFavicon(w http.ResponseWriter, r *http.Request) {
