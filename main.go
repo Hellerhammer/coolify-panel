@@ -41,6 +41,10 @@ type Config struct {
 	CoolifyURL   string     `yaml:"coolify_url"`
 	CoolifyToken string     `yaml:"coolify_token"`
 	Resources    []Resource `yaml:"resources"`
+	// Optional: URL the "Logout" button points to. Typically the forward-auth
+	// proxy's sign-out endpoint, e.g. "/outpost.goauthentik.io/sign_out".
+	// If empty, the button is not rendered.
+	LogoutURL string `yaml:"logout_url"`
 	// If true, dev mode lets you pass ?user=alice&groups=admins instead of auth headers.
 	DevMode bool `yaml:"dev_mode"`
 }
@@ -94,6 +98,8 @@ func main() {
 
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/action", handleAction)
+	http.HandleFunc("/status", handleStatus)
+	http.HandleFunc("/coolify-status", handleCoolifyStatus)
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 
 	addr := ":8080"
@@ -181,11 +187,115 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	data := struct {
 		User      user
 		Resources []Resource
-	}{u, visibleResources(u)}
+		LogoutURL string
+	}{u, visibleResources(u), cfg.LogoutURL}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := indexTmpl.Execute(w, data); err != nil {
 		log.Printf("template error: %v", err)
 	}
+}
+
+func handleCoolifyStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	u, ok := getUser(r)
+	if !ok || u.Name == "" {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+
+	// Hit a lightweight auth-required Coolify endpoint to verify both
+	// reachability and that our token still works. /api/v1/teams is
+	// available on current Coolify and returns 200 with the team list.
+	endpoint := cfg.CoolifyURL + "/api/v1/teams"
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "reason": "unreachable"})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":     false,
+		"reason": fmt.Sprintf("http %d", resp.StatusCode),
+	})
+}
+
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	u, ok := getUser(r)
+	if !ok || u.Name == "" {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+
+	uuid := r.URL.Query().Get("uuid")
+	var res *Resource
+	for i := range cfg.Resources {
+		if cfg.Resources[i].UUID == uuid {
+			res = &cfg.Resources[i]
+			break
+		}
+	}
+	if res == nil || !userCanSee(u, *res) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/%s/%s", cfg.CoolifyURL, res.Kind, uuid)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		log.Printf("coolify status call failed: %v", err)
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("coolify status returned %d for %s", resp.StatusCode, uuid)
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
+		return
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Status == "" {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": payload.Status})
 }
 
 func handleAction(w http.ResponseWriter, r *http.Request) {

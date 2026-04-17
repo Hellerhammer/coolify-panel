@@ -3,6 +3,12 @@
 coolify_url: "http://coolify:8000"
 coolify_token: ""  # -> COOLIFY_TOKEN env var
 
+# Optional: URL the "Logout" button points to. Typically the forward-auth
+# proxy's sign-out endpoint. Leave empty (or omit) to hide the button.
+#   Authentik: "/outpost.goauthentik.io/sign_out"
+#   Authelia:  "/logout"
+logout_url: ""
+
 # dev_mode: true allows ?user=alice&groups=admins in the URL (for local testing only!)
 dev_mode: false
 

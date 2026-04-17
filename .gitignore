@@ -16,3 +16,8 @@ config.yaml
 .idea/
 *.swp
 .DS_Store
+
+# Other
+*.sum
+CLAUDE.md
+

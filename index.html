@@ -27,12 +27,38 @@
   .toast.show { opacity: 1; }
   .toast.err { background: #c0392b; }
   .empty { opacity: .6; text-align: center; padding: 2rem; }
+  .status { display:flex; align-items:center; gap:.4rem; font-size:.8rem; opacity:.8; }
+  .status .dot { width:.6rem; height:.6rem; border-radius:50%;
+                 background: color-mix(in srgb, currentColor 40%, transparent); }
+  .status[data-status="running"] .dot { background: #22c55e; }
+  .status[data-status="exited"] .dot,
+  .status[data-status="stopped"] .dot,
+  .status[data-status="dead"] .dot { background: #ef4444; }
+  .status[data-status="restarting"] .dot,
+  .status[data-status="starting"] .dot,
+  .status[data-status="degraded"] .dot { background: #eab308; }
+  .header-right { display:flex; align-items:center; gap:.9rem; }
+  .coolify-status { display:flex; align-items:center; gap:.35rem; font-size:.8rem; opacity:.8; }
+  .coolify-status .dot { width:.55rem; height:.55rem; border-radius:50%;
+                         background: color-mix(in srgb, currentColor 40%, transparent); }
+  .coolify-status[data-ok="true"] .dot { background: #22c55e; }
+  .coolify-status[data-ok="false"] .dot { background: #ef4444; }
+  a.logout { color: inherit; opacity:.7; text-decoration: none; font-size:.85rem;
+             border:1px solid currentColor; padding:.25rem .6rem; border-radius:6px; }
+  a.logout:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
+  button[hidden] { display: none; }
 </style>
 </head>
 <body>
 <header>
   <h1>Service Panel</h1>
-  <span class="user">👤 {{.User.Name}}</span>
+  <div class="header-right">
+    <span id="coolify-status" class="coolify-status" data-ok="unknown" title="Coolify API">
+      <span class="dot"></span><span class="coolify-status-label">Coolify …</span>
+    </span>
+    <span class="user">👤 {{.User.Name}}</span>
+    {{if .LogoutURL}}<a class="logout" href="{{.LogoutURL}}">Logout</a>{{end}}
+  </div>
 </header>
 
 {{if not .Resources}}
@@ -45,6 +71,9 @@
     <div>
       <div class="name">{{.Name}}</div>
       <div class="kind">{{.Kind}}</div>
+    </div>
+    <div class="status" data-status="unknown">
+      <span class="dot"></span><span class="status-label">…</span>
     </div>
   </div>
   <div class="actions">
@@ -92,6 +121,7 @@ document.querySelectorAll('button[data-action]').forEach(btn => {
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         showToast('✓ ' + (data.message || action));
+        refreshStatus(card);
       } else {
         showToast('✗ ' + (data.message || res.statusText), true);
       }
@@ -103,6 +133,72 @@ document.querySelectorAll('button[data-action]').forEach(btn => {
     }
   });
 });
+
+// Coolify may return compound statuses like "running:healthy" — we only
+// care about the first token for bucketing.
+function bucket(status) {
+  const head = status.split(':')[0];
+  if (head === 'running' || head === 'degraded') return 'up';
+  if (head === 'starting' || head === 'restarting') return 'transitional';
+  if (head === 'exited' || head === 'stopped' || head === 'dead') return 'down';
+  return 'unknown';
+}
+
+function applyButtonVisibility(card, bucketName) {
+  card.querySelectorAll('button[data-action]').forEach(btn => {
+    const a = btn.dataset.action;
+    let show = true, disable = false;
+    if (bucketName === 'up') {
+      show = (a === 'stop' || a === 'restart');
+    } else if (bucketName === 'down') {
+      show = (a === 'start');
+    } else if (bucketName === 'transitional') {
+      disable = true;
+    }
+    // For 'unknown': show everything, let the user try.
+    btn.hidden = !show;
+    btn.disabled = disable;
+  });
+}
+
+async function refreshStatus(card) {
+  const uuid = card.dataset.uuid;
+  const el = card.querySelector('.status');
+  try {
+    const r = await fetch('/status?uuid=' + encodeURIComponent(uuid));
+    const data = await r.json().catch(() => ({}));
+    const s = (data.status || 'unknown').toLowerCase();
+    el.dataset.status = s.split(':')[0];
+    el.querySelector('.status-label').textContent = s;
+    applyButtonVisibility(card, bucket(s));
+  } catch {
+    el.dataset.status = 'unknown';
+    el.querySelector('.status-label').textContent = 'unknown';
+    applyButtonVisibility(card, 'unknown');
+  }
+}
+function refreshAll() {
+  document.querySelectorAll('.card').forEach(refreshStatus);
+}
+
+async function refreshCoolifyStatus() {
+  const el = document.getElementById('coolify-status');
+  try {
+    const r = await fetch('/coolify-status');
+    const data = await r.json().catch(() => ({}));
+    el.dataset.ok = data.ok ? 'true' : 'false';
+    el.querySelector('.coolify-status-label').textContent =
+      data.ok ? 'Coolify OK' : 'Coolify ' + (data.reason || 'down');
+  } catch {
+    el.dataset.ok = 'false';
+    el.querySelector('.coolify-status-label').textContent = 'Coolify down';
+  }
+}
+
+refreshAll();
+refreshCoolifyStatus();
+setInterval(refreshAll, 10000);
+setInterval(refreshCoolifyStatus, 15000);
 </script>
 </body>
 </html>
