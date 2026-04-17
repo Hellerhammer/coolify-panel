@@ -100,13 +100,22 @@ func getUser(r *http.Request) (user, bool) {
 			Groups: splitCSV(r.URL.Query().Get("groups")),
 		}, true
 	}
-	name := r.Header.Get("Remote-User")
+	// Supports both Authentik (X-authentik-*) and Authelia (Remote-*) headers.
+	name := r.Header.Get("X-authentik-username")
+	groups := r.Header.Get("X-authentik-groups")
+	if name == "" {
+		name = r.Header.Get("Remote-User")
+		groups = r.Header.Get("Remote-Groups")
+	}
 	if name == "" {
 		return user{}, false
 	}
+	// Authentik uses "|" as separator for groups, Authelia uses ",".
+	// splitCSV already handles "," — normalize "|" first.
+	groups = strings.ReplaceAll(groups, "|", ",")
 	return user{
 		Name:   name,
-		Groups: splitCSV(r.Header.Get("Remote-Groups")),
+		Groups: splitCSV(groups),
 	}, true
 }
 
@@ -153,7 +162,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	u, ok := getUser(r)
 	if !ok || u.Name == "" {
-		http.Error(w, "unauthenticated (no Remote-User header)", http.StatusUnauthorized)
+		http.Error(w, "unauthenticated (no auth headers)", http.StatusUnauthorized)
 		return
 	}
 	data := struct {
