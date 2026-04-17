@@ -2,6 +2,7 @@ services:
   panel:
     build: .
     restart: unless-stopped
+    container_name: coolify-panel
     environment:
       # When deployed in Coolify, the Coolify API is reachable as "coolify:8080"
       # from the same Docker network that Coolify uses.
