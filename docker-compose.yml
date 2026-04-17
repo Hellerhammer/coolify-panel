@@ -10,6 +10,12 @@ services:
       # CONFIG_YAML holds the entire panel config as a multiline string.
       # Set it in Coolify's Environment Variables UI (enable "Is Multiline").
       CONFIG_YAML: "${CONFIG_YAML}"
+    healthcheck:
+      test: ["CMD", "/panel", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     labels:
       # Attach Authentik forward-auth middleware (defined as dynamic config
       # in Coolify: Server -> Proxy -> Dynamic Configurations).

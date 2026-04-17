@@ -58,6 +58,22 @@ var (
 )
 
 func main() {
+	// Self-healthcheck mode: the distroless runtime image has no shell or
+	// curl, so the Docker HEALTHCHECK runs this binary with -healthcheck,
+	// which hits /healthz on localhost and exits 0/1 accordingly.
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get("http://127.0.0.1:8080/healthz")
+		if err != nil {
+			os.Exit(1)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	// Config can come from two places:
 	//   1. The CONFIG_YAML env var (whole yaml contents as a string) — preferred
 	//      in container platforms like Coolify.
