@@ -4,9 +4,11 @@ services:
     restart: unless-stopped
     container_name: coolify-panel
     environment:
-      # When deployed in Coolify, the Coolify API is reachable as "coolify:8080"
-      # from the same Docker network that Coolify uses.
-      COOLIFY_URL: "http://coolify:8080"
+      # NOTE: do NOT use the name COOLIFY_URL — Coolify reserves that and
+      # auto-injects the deployed app's OWN FQDN into it, which clobbers any
+      # value we set here. The Go side reads COOLIFY_API_URL to avoid this.
+      # Internal Docker hostname inside Coolify's network:
+      COOLIFY_API_URL: "http://coolify:8080"
       COOLIFY_TOKEN: "${COOLIFY_TOKEN}"
       # CONFIG_YAML holds the entire panel config as a multiline string.
       # Set it in Coolify's Environment Variables UI (enable "Is Multiline").

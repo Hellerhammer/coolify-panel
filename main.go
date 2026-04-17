@@ -102,7 +102,10 @@ func main() {
 	if t := os.Getenv("COOLIFY_TOKEN"); t != "" {
 		cfg.CoolifyToken = t
 	}
-	if u := os.Getenv("COOLIFY_URL"); u != "" {
+	// Note: COOLIFY_URL is a reserved Coolify-injected variable pointing at
+	// the *deployed app's own FQDN*, which is not what we want. Use
+	// COOLIFY_API_URL to avoid the clash.
+	if u := os.Getenv("COOLIFY_API_URL"); u != "" {
 		cfg.CoolifyURL = u
 	}
 	cfg.CoolifyURL = strings.TrimRight(cfg.CoolifyURL, "/")
