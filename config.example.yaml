@@ -26,7 +26,8 @@ resources:
     allowed_users: ["alice"]
     allowed_groups: ["gamers"]
     actions: [restart, start, stop]
-    editable_envs: ["MY_APP_VAR", "ANOTHER_VAR"]
+    expose_all_envs: true
+    # editable_envs: ["MY_APP_VAR", "ANOTHER_VAR"]
 
   - name: "TeamSpeak 6"
     uuid: "xxx-yyy-zzz"

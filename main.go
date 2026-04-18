@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -36,6 +37,7 @@ type Resource struct {
 	AllowedGroups []string     `yaml:"allowed_groups"` // groups from Remote-Groups
 	Actions       []string     `yaml:"actions"`        // subset of: restart, start, stop
 	EditableEnvs  []string     `yaml:"editable_envs"`  // environment variables allowed to be edited
+	ExposeAllEnvs bool         `yaml:"expose_all_envs"` // if true, all environment variables are editable
 }
 
 type Config struct {
@@ -57,9 +59,105 @@ var (
 	rateLimit       = make(map[string]time.Time)
 	rateMu          sync.Mutex
 	rateWindow      = 10 * time.Second
-	restartRequired = make(map[string]bool)
+	restartRequired = make(map[string]time.Time)
 	restartMu       sync.Mutex
+
+	// Reused across all outbound calls to Coolify. Per-request deadlines are
+	// applied via context.WithTimeout, not via the client's Timeout field.
+	coolifyClient = &http.Client{Timeout: 30 * time.Second}
 )
+
+// startMapCleanup runs a background loop to prune old entries from the rate
+// limit and restart-required maps to prevent unbounded memory growth.
+func startMapCleanup() {
+	go func() {
+		for range time.Tick(1 * time.Hour) {
+			now := time.Now()
+			rateMu.Lock()
+			for k, t := range rateLimit {
+				if now.Sub(t) > 1*time.Hour {
+					delete(rateLimit, k)
+				}
+			}
+			rateMu.Unlock()
+
+			restartMu.Lock()
+			for k, t := range restartRequired {
+				if now.Sub(t) > 24*time.Hour {
+					delete(restartRequired, k)
+				}
+			}
+			restartMu.Unlock()
+		}
+	}()
+}
+
+// validActions is the closed set of verbs we let the UI trigger.
+var validActions = []string{"restart", "start", "stop"}
+
+// validateConfig checks the loaded configuration for logical errors or
+// unreachable resources and logs warnings/fatals accordingly.
+func validateConfig() {
+	for _, res := range cfg.Resources {
+		if res.Kind != KindApplication && res.Kind != KindService && res.Kind != KindDatabase {
+			log.Fatalf("resource %q: unknown kind %q (must be applications, services, or databases)", res.Name, res.Kind)
+		}
+		if len(res.AllowedUsers) == 0 && len(res.AllowedGroups) == 0 {
+			log.Printf("WARNING: resource %q (uuid=%s) has no allowed_users or allowed_groups; it will be unreachable", res.Name, res.UUID)
+		}
+		for _, action := range res.Actions {
+			if !slices.Contains(validActions, action) {
+				log.Printf("WARNING: resource %q has unknown action %q", res.Name, action)
+			}
+		}
+	}
+}
+
+// callCoolify builds an authenticated request with a per-call timeout derived
+// from the inbound request's context. Callers own closing resp.Body.
+func callCoolify(ctx context.Context, method, endpoint string, body io.Reader, timeout time.Duration) (*http.Response, error) {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	req, err := http.NewRequestWithContext(cctx, method, endpoint, body)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := coolifyClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	// Cancel once the body is closed so the timeout context is released.
+	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnCloseBody) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
+// writeJSON serializes v to w; a failed write is logged but not fatal.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if status != 0 {
+		w.WriteHeader(status)
+	}
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("writeJSON encode failed: %v", err)
+	}
+}
 
 func main() {
 	// Self-healthcheck mode: the distroless runtime image has no shell or
@@ -117,6 +215,9 @@ func main() {
 		log.Fatal("coolify_url and coolify_token are required")
 	}
 
+	validateConfig()
+	startMapCleanup()
+
 	indexTmpl = template.Must(template.ParseFS(tmplFS, "index.html"))
 	detailsTmpl = template.Must(template.ParseFS(tmplFS, "details.html"))
 
@@ -126,11 +227,16 @@ func main() {
 	http.HandleFunc("/action", handleAction)
 	http.HandleFunc("/status", handleStatus)
 	http.HandleFunc("/envs", handleEnvs)
+	http.HandleFunc("/logs", handleLogs)
+	http.HandleFunc("/deployments", handleDeployments)
 	http.HandleFunc("/coolify-status", handleCoolifyStatus)
 	http.HandleFunc("/favicon.ico", handleFavicon)
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 
 	addr := ":8080"
+	if cfg.DevMode {
+		log.Printf("WARNING: dev_mode=true — authentication is BYPASSED; do not run this in production")
+	}
 	log.Printf("listening on %s (dev_mode=%v, %d resources, coolify_url=%s)", addr, cfg.DevMode, len(cfg.Resources), cfg.CoolifyURL)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
@@ -229,13 +335,13 @@ func userCanSee(u user, res Resource) bool {
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		log.Printf("not found: %s", r.URL.Path)
 		http.NotFound(w, r)
 		return
 	}
 	u, ok := getUser(r)
 	if !ok || u.Name == "" {
-		http.Error(w, "unauthenticated (no auth headers)", http.StatusUnauthorized)
+		log.Printf("audit unauthenticated from=%s path=%s", r.RemoteAddr, r.URL.Path)
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
 		return
 	}
 	data := struct {
@@ -256,6 +362,7 @@ func handleCoolifyStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	u, ok := getUser(r)
 	if !ok || u.Name == "" {
+		log.Printf("audit unauthenticated from=%s path=%s", r.RemoteAddr, r.URL.Path)
 		http.Error(w, "unauthenticated", http.StatusUnauthorized)
 		return
 	}
@@ -264,16 +371,7 @@ func handleCoolifyStatus(w http.ResponseWriter, r *http.Request) {
 	// reachability and that our token still works. /api/v1/teams is
 	// available on current Coolify and returns 200 with the team list.
 	endpoint := cfg.CoolifyURL + "/api/v1/teams"
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := callCoolify(r.Context(), http.MethodGet, endpoint, nil, 5*time.Second)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "reason": "unreachable"})
@@ -291,7 +389,10 @@ func handleCoolifyStatus(w http.ResponseWriter, r *http.Request) {
 	// behind a forward-auth proxy, that proxy returns 200 with its login
 	// page. Require a JSON body as a minimal sanity check that we actually
 	// reached the Coolify API.
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("coolify status body read failed: %v", err)
+	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") || !json.Valid(body) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "reason": "not coolify (auth proxy?)"})
 		return
@@ -304,48 +405,29 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
-	u, ok := getUser(r)
-	if !ok || u.Name == "" {
-		http.Error(w, "unauthenticated", http.StatusUnauthorized)
-		return
-	}
-
 	uuid := r.URL.Query().Get("uuid")
-	var res *Resource
-	for i := range cfg.Resources {
-		if cfg.Resources[i].UUID == uuid {
-			res = &cfg.Resources[i]
-			break
-		}
-	}
-	if res == nil || !userCanSee(u, *res) {
-		http.Error(w, "not found", http.StatusNotFound)
+	res, u := findAndAuthorize(w, r, uuid)
+	if res == nil {
 		return
 	}
 
 	endpoint := fmt.Sprintf("%s/api/v1/%s/%s", cfg.CoolifyURL, res.Kind, uuid)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := callCoolify(r.Context(), http.MethodGet, endpoint, nil, 10*time.Second)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
-		log.Printf("coolify status call failed: %v", err)
+		log.Printf("coolify status call failed for %s (user %s): %v", uuid, u.Name, err)
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("coolify status body read failed for %s: %v", uuid, err)
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("coolify status %d for %s: %.200s", resp.StatusCode, uuid, string(body))
+		log.Printf("coolify status %d for %s (user %s): %.200s", resp.StatusCode, uuid, u.Name, string(body))
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
 		return
@@ -367,7 +449,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	restartMu.Lock()
-	needsRestart := restartRequired[uuid]
+	_, needsRestart := restartRequired[uuid]
 	restartMu.Unlock()
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -381,28 +463,15 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	u, ok := getUser(r)
-	if !ok || u.Name == "" {
-		http.Error(w, "unauthenticated", http.StatusUnauthorized)
-		return
-	}
-
 	uuid := r.FormValue("uuid")
 	action := r.FormValue("action")
 
-	// Find the resource and verify the user is allowed to touch it + action is whitelisted.
-	var res *Resource
-	for i := range cfg.Resources {
-		if cfg.Resources[i].UUID == uuid {
-			res = &cfg.Resources[i]
-			break
-		}
-	}
-	if res == nil || !userCanSee(u, *res) {
-		http.Error(w, "not found", http.StatusNotFound)
+	res, u := findAndAuthorize(w, r, uuid)
+	if res == nil {
 		return
 	}
 	if !slices.Contains(res.Actions, action) {
+		log.Printf("audit user=%s deny=action action=%s uuid=%s", u.Name, action, uuid)
 		http.Error(w, "action not allowed for this resource", http.StatusForbidden)
 		return
 	}
@@ -412,6 +481,7 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 	rateMu.Lock()
 	if last, ok := rateLimit[rateKey]; ok && time.Since(last) < rateWindow {
 		rateMu.Unlock()
+		log.Printf("audit user=%s rate_limited uuid=%s action=%s", u.Name, uuid, action)
 		http.Error(w, "rate limited, please wait", http.StatusTooManyRequests)
 		return
 	}
@@ -421,23 +491,17 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/%s", cfg.CoolifyURL, res.Kind, uuid, action)
 	log.Printf("audit user=%s action=%s kind=%s name=%q uuid=%s", u.Name, action, res.Kind, res.Name, uuid)
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpoint, nil)
+	resp, err := callCoolify(r.Context(), http.MethodPost, endpoint, nil, 30*time.Second)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("coolify call failed: %v", err)
+		log.Printf("coolify action %s failed for %s (user %s): %v", action, uuid, u.Name, err)
 		http.Error(w, "coolify unreachable", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("coolify action body read failed for %s: %v", uuid, err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -452,7 +516,7 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	log.Printf("coolify action %s %s -> %d: %.200s", action, uuid, resp.StatusCode, string(body))
+	log.Printf("coolify action %s %s -> %d (user %s): %.200s", action, uuid, resp.StatusCode, u.Name, string(body))
 	w.WriteHeader(http.StatusBadGateway)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":      false,
@@ -461,21 +525,9 @@ func handleAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDetails(w http.ResponseWriter, r *http.Request) {
-	u, ok := getUser(r)
-	if !ok || u.Name == "" {
-		http.Error(w, "unauthenticated", http.StatusUnauthorized)
-		return
-	}
 	uuid := r.URL.Query().Get("uuid")
-	var res *Resource
-	for i := range cfg.Resources {
-		if cfg.Resources[i].UUID == uuid {
-			res = &cfg.Resources[i]
-			break
-		}
-	}
-	if res == nil || !userCanSee(u, *res) {
-		http.Error(w, "not found", http.StatusNotFound)
+	res, u := findAndAuthorize(w, r, uuid)
+	if res == nil {
 		return
 	}
 	data := struct {
@@ -490,56 +542,40 @@ func handleDetails(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleEnvs(w http.ResponseWriter, r *http.Request) {
-	u, ok := getUser(r)
-	if !ok || u.Name == "" {
-		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+	uuid := r.URL.Query().Get("uuid")
+	if uuid == "" {
+		uuid = r.FormValue("uuid")
+	}
+	res, u := findAndAuthorize(w, r, uuid)
+	if res == nil {
 		return
 	}
 
 	if r.Method == http.MethodGet {
-		handleEnvsGet(w, r, u)
+		handleEnvsGet(w, r, u, res)
 	} else if r.Method == http.MethodPost {
-		handleEnvsPost(w, r, u)
+		handleEnvsPost(w, r, u, res)
 	} else {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user) {
-	uuid := r.URL.Query().Get("uuid")
-	var res *Resource
-	for i := range cfg.Resources {
-		if cfg.Resources[i].UUID == uuid {
-			res = &cfg.Resources[i]
-			break
-		}
-	}
-	if res == nil || !userCanSee(u, *res) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs?decrypt=true", cfg.CoolifyURL, res.Kind, uuid)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user, res *Resource) {
+	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs?decrypt=true", cfg.CoolifyURL, res.Kind, res.UUID)
+	resp, err := callCoolify(r.Context(), http.MethodGet, endpoint, nil, 10*time.Second)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
+		log.Printf("coolify envs call failed for %s (user %s): %v", res.UUID, u.Name, err)
 		http.Error(w, "coolify unreachable", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	log.Printf("DEBUG: Coolify envs response for %s: %s", uuid, string(body))
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("coolify envs body read failed for %s: %v", res.UUID, err)
+	}
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("coolify envs get failed for %s: %d %.200s", uuid, resp.StatusCode, string(body))
+		log.Printf("coolify envs get %d for %s (user %s): %.200s", resp.StatusCode, res.UUID, u.Name, string(body))
 		http.Error(w, "coolify error", http.StatusBadGateway)
 		return
 	}
@@ -558,46 +594,16 @@ func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user) {
 		if err2 := json.Unmarshal(body, &wrapper); err2 == nil {
 			allEnvs = wrapper.Data
 		} else {
-			log.Printf("failed to decode envs from %s: %v. Body: %.500s", uuid, err, string(body))
+			log.Printf("failed to decode envs from %s: %v. Body: %.500s", res.UUID, err, string(body))
 			http.Error(w, "failed to decode envs", http.StatusInternalServerError)
 			return
 		}
 	}
 
-	// Fallback for Services: if values are missing, try fetching from the service detail endpoint
-	if res.Kind == KindService {
-		hasValues := false
-		for _, e := range allEnvs {
-			if e.Value != nil && *e.Value != "" {
-				hasValues = true
-				break
-			}
-		}
-
-		if !hasValues {
-			log.Printf("DEBUG: No values found in /envs for service %s, trying fallback to service detail", uuid)
-			serviceEndpoint := fmt.Sprintf("%s/api/v1/services/%s?decrypt=true", cfg.CoolifyURL, uuid)
-			req2, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, serviceEndpoint, nil)
-			req2.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
-			req2.Header.Set("Accept", "application/json")
-			resp2, err := client.Do(req2)
-			if err == nil && resp2.StatusCode == http.StatusOK {
-				defer resp2.Body.Close()
-				var serviceData struct {
-					EnvironmentVariables []envVar `json:"environment_variables"`
-				}
-				if err := json.NewDecoder(resp2.Body).Decode(&serviceData); err == nil && len(serviceData.EnvironmentVariables) > 0 {
-					log.Printf("DEBUG: Found %d envs in service detail fallback", len(serviceData.EnvironmentVariables))
-					allEnvs = serviceData.EnvironmentVariables
-				}
-			}
-		}
-	}
-
-	// Filter based on EditableEnvs
+	// Filter based on EditableEnvs or expose all
 	var filtered []map[string]any
 	for _, env := range allEnvs {
-		if slices.Contains(res.EditableEnvs, env.Key) {
+		if res.ExposeAllEnvs || slices.Contains(res.EditableEnvs, env.Key) {
 			val := ""
 			if env.Value != nil {
 				val = *env.Value
@@ -613,29 +619,16 @@ func handleEnvsGet(w http.ResponseWriter, r *http.Request, u user) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"envs": filtered})
 }
 
-func handleEnvsPost(w http.ResponseWriter, r *http.Request, u user) {
-	uuid := r.FormValue("uuid")
+func handleEnvsPost(w http.ResponseWriter, r *http.Request, u user, res *Resource) {
 	key := r.FormValue("key")
 	value := r.FormValue("value")
 
-	var res *Resource
-	for i := range cfg.Resources {
-		if cfg.Resources[i].UUID == uuid {
-			res = &cfg.Resources[i]
-			break
-		}
-	}
-	if res == nil || !userCanSee(u, *res) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	if !slices.Contains(res.EditableEnvs, key) {
+	if !res.ExposeAllEnvs && !slices.Contains(res.EditableEnvs, key) {
 		http.Error(w, "env var not editable", http.StatusForbidden)
 		return
 	}
 
-	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs", cfg.CoolifyURL, res.Kind, uuid)
+	endpoint := fmt.Sprintf("%s/api/v1/%s/%s/envs", cfg.CoolifyURL, res.Kind, res.UUID)
 	// Sending is_literal: true and is_shown_on_frontend: true (where applicable)
 	// can help ensure values are stored as raw strings and returned in future calls.
 	payload, _ := json.Marshal(map[string]any{
@@ -645,32 +638,190 @@ func handleEnvsPost(w http.ResponseWriter, r *http.Request, u user) {
 		"is_shown_on_frontend": true,
 	})
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPatch, endpoint, strings.NewReader(string(payload)))
+	resp, err := callCoolify(r.Context(), http.MethodPatch, endpoint, strings.NewReader(string(payload)), 10*time.Second)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+cfg.CoolifyToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
+		log.Printf("coolify envs update failed for %s (user %s): %v", res.UUID, u.Name, err)
 		http.Error(w, "coolify unreachable", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("coolify envs update %d for %s (user %s): %.200s", resp.StatusCode, res.UUID, u.Name, string(body))
 		http.Error(w, fmt.Sprintf("coolify error %d", resp.StatusCode), http.StatusBadGateway)
 		return
 	}
 
 	restartMu.Lock()
-	restartRequired[uuid] = true
+	restartRequired[res.UUID] = time.Now()
 	restartMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// findAndAuthorize does the user/resource/whitelist dance shared by every
+// resource-scoped handler. On failure it writes the HTTP error and returns nil.
+func findAndAuthorize(w http.ResponseWriter, r *http.Request, uuid string) (*Resource, user) {
+	u, ok := getUser(r)
+	if !ok || u.Name == "" {
+		log.Printf("audit unauthenticated from=%s path=%s", r.RemoteAddr, r.URL.Path)
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return nil, u
+	}
+	for i := range cfg.Resources {
+		if cfg.Resources[i].UUID == uuid {
+			res := &cfg.Resources[i]
+			if !userCanSee(u, *res) {
+				log.Printf("audit user=%s deny=resource uuid=%s path=%s", u.Name, uuid, r.URL.Path)
+				http.Error(w, "not found", http.StatusNotFound)
+				return nil, u
+			}
+			return res, u
+		}
+	}
+	log.Printf("audit user=%s deny=resource uuid=%s path=%s", u.Name, uuid, r.URL.Path)
+	http.Error(w, "not found", http.StatusNotFound)
+	return nil, u
+}
+
+func handleLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	res, u := findAndAuthorize(w, r, r.URL.Query().Get("uuid"))
+	if res == nil {
+		return
+	}
+	if res.Kind != KindApplication {
+		http.Error(w, "logs are only available for applications", http.StatusBadRequest)
+		return
+	}
+
+	lines := 200
+	if s := r.URL.Query().Get("lines"); s != "" {
+		if n, err := fmt.Sscanf(s, "%d", &lines); err != nil || n != 1 {
+			lines = 200
+		}
+	}
+	if lines < 1 {
+		lines = 1
+	}
+	if lines > 1000 {
+		lines = 1000
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/applications/%s/logs?lines=%d", cfg.CoolifyURL, res.UUID, lines)
+	resp, err := callCoolify(r.Context(), http.MethodGet, endpoint, nil, 15*time.Second)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		log.Printf("coolify logs call failed for %s (user %s): %v", res.UUID, u.Name, err)
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"logs": "", "error": "unreachable"})
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("coolify logs body read failed for %s: %v", res.UUID, err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("coolify logs %d for %s (user %s): %.200s", resp.StatusCode, res.UUID, u.Name, string(body))
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"logs": "", "error": fmt.Sprintf("http %d", resp.StatusCode)})
+		return
+	}
+	w.Write(body)
+}
+
+func handleDeployments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	res, u := findAndAuthorize(w, r, r.URL.Query().Get("uuid"))
+	if res == nil {
+		return
+	}
+	if res.Kind != KindApplication {
+		http.Error(w, "deployments are only available for applications", http.StatusBadRequest)
+		return
+	}
+
+	deploymentUUID := r.URL.Query().Get("deployment_uuid")
+	var endpoint string
+	if deploymentUUID != "" {
+		endpoint = fmt.Sprintf("%s/api/v1/deployments/%s", cfg.CoolifyURL, deploymentUUID)
+	} else {
+		endpoint = fmt.Sprintf("%s/api/v1/deployments/applications/%s?skip=0&take=10", cfg.CoolifyURL, res.UUID)
+	}
+
+	resp, err := callCoolify(r.Context(), http.MethodGet, endpoint, nil, 15*time.Second)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		log.Printf("coolify deployments call failed for %s (user %s): %v", res.UUID, u.Name, err)
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "unreachable"})
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("coolify deployments body read failed for %s: %v", res.UUID, err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("coolify deployments %d for %s (user %s): %.200s", resp.StatusCode, res.UUID, u.Name, string(body))
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": fmt.Sprintf("http %d", resp.StatusCode)})
+		return
+	}
+
+	if deploymentUUID != "" {
+		// Single deployment: extract just the fields the UI needs.
+		var full map[string]any
+		if err := json.Unmarshal(body, &full); err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "decode"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"logs":       full["logs"],
+			"status":     full["status"],
+			"commit":     full["commit"],
+			"commit_msg": full["commit_message"],
+			"created_at": full["created_at"],
+		})
+		return
+	}
+
+	// List: slim each entry.
+	var list []map[string]any
+	if err := json.Unmarshal(body, &list); err != nil {
+		// Coolify sometimes wraps in {data: [...]}.
+		var wrap struct {
+			Data []map[string]any `json:"data"`
+		}
+		if err2 := json.Unmarshal(body, &wrap); err2 == nil {
+			list = wrap.Data
+		} else {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "decode"})
+			return
+		}
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, d := range list {
+		out = append(out, map[string]any{
+			"deployment_uuid": d["deployment_uuid"],
+			"status":          d["status"],
+			"commit":          d["commit"],
+			"commit_msg":      d["commit_message"],
+			"created_at":      d["created_at"],
+		})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"deployments": out})
 }

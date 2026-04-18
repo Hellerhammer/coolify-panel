@@ -51,6 +51,30 @@
            opacity: 0; transition: opacity .2s; pointer-events: none; }
   .toast.show { opacity: 1; }
   .toast.err { background: #c0392b; }
+  .log-output { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: 0.8rem; line-height: 1.4;
+                background: color-mix(in srgb, currentColor 6%, transparent);
+                border: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+                border-radius: 6px; padding: 0.8rem;
+                height: 320px; overflow: auto; white-space: pre-wrap;
+                word-break: break-all; margin: 0; }
+  .log-output.empty { display: flex; align-items: center; justify-content: center;
+                      opacity: 0.5; font-style: italic; }
+  .log-controls { display: flex; gap: 0.6rem; align-items: center;
+                  margin-bottom: 0.6rem; font-size: 0.85rem; flex-wrap: wrap; }
+  .log-controls .spacer { flex: 1; }
+  .log-live-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%;
+                  background: #22c55e; opacity: 0.25; transition: opacity 0.2s; }
+  .log-live-dot.active { opacity: 1; }
+  .log-btn { font: inherit; font-size: 0.8rem; padding: 0.2rem 0.6rem;
+             border-radius: 5px; border: 1px solid currentColor;
+             background: transparent; cursor: pointer; }
+  .log-btn:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+  .deploy-picker { font: inherit; font-size: 0.85rem; padding: 0.25rem 0.4rem;
+                   border-radius: 5px; flex: 1; min-width: 0;
+                   border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+                   background: transparent; color: inherit; }
+  .muted-note { opacity: 0.6; font-size: 0.9rem; margin: 0; }
 </style>
 </head>
 <body>
@@ -83,27 +107,40 @@
     {{end}}
   </div>
 
-  {{if .Resource.EditableEnvs}}
+  {{if or .Resource.EditableEnvs .Resource.ExposeAllEnvs}}
   <div class="section-title">Environment Variables</div>
 
   <div class="env-list" id="env-list">
-    {{range .Resource.EditableEnvs}}
-    <div class="env-item" data-key="{{.}}">
-      <div class="env-label">{{.}}</div>
-      <div class="env-input-group">
-        <input type="text" class="env-input" placeholder="Loading..." disabled>
-        <button class="save-btn" disabled>Save</button>
-      </div>
-    </div>
-    {{end}}
+    <p class="muted-note">Loading variables...</p>
   </div>
   <div id="restart-warning" style="display: none; background: color-mix(in srgb, #eab308 15%, transparent); border: 1px solid #eab308; color: #eab308; padding: 0.8rem; border-radius: 6px; margin-top: 1rem; font-size: 0.9rem;">
     ⚠️ <strong>Note:</strong> A restart is required for the changes to take effect.
   </div>
   {{end}}
 
-  <div class="section-title">Future Features</div>
-  <p style="opacity: 0.6; font-size: 0.9rem;">Logs and more metrics coming soon...</p>
+  {{if eq (printf "%s" .Resource.Kind) "applications"}}
+  <div class="section-title">Live Logs</div>
+  <div class="log-controls">
+    <span class="log-live-dot" id="live-dot"></span>
+    <span id="live-status" style="opacity: 0.7;">Live</span>
+    <span style="opacity: 0.5;">· last 200 lines</span>
+    <div class="spacer"></div>
+    <button type="button" class="log-btn" id="live-toggle">Pause</button>
+  </div>
+  <pre class="log-output empty" id="live-logs">Loading…</pre>
+
+  <div class="section-title">Deployment Logs</div>
+  <div class="log-controls">
+    <select class="deploy-picker" id="deployment-picker" disabled>
+      <option>Loading deployments…</option>
+    </select>
+    <button type="button" class="log-btn" id="deploy-reload" title="Reload">⟳</button>
+  </div>
+  <pre class="log-output empty" id="deploy-logs">Select a deployment to view its logs.</pre>
+  {{else}}
+  <div class="section-title">Logs</div>
+  <p class="muted-note">Live logs and deployment logs are only available for applications via the Coolify API — not for services or databases.</p>
+  {{end}}
 </div>
 
 <div id="toast" class="toast"></div>
@@ -160,62 +197,78 @@ async function loadEnvs() {
   try {
     const r = await fetch('/envs?uuid=' + encodeURIComponent(uuid));
     const data = await r.json().catch(() => ({}));
-    
-    // Always enable all inputs so unset vars can be filled
-    envList.querySelectorAll('.env-item').forEach(item => {
-      const input = item.querySelector('.env-input');
-      const btn = item.querySelector('.save-btn');
-      input.disabled = false;
-      input.placeholder = "";
-      btn.disabled = false;
-    });
 
-    if (data.envs) {
+    if (data.envs && data.envs.length > 0) {
+      envList.replaceChildren();
       data.envs.forEach(env => {
-        const item = envList.querySelector(`.env-item[data-key="${env.key}"]`);
-        if (item) {
-          item.querySelector('.env-input').value = env.value;
-        }
+        const item = document.createElement('div');
+        item.className = 'env-item';
+        item.dataset.key = env.key;
+
+        const label = document.createElement('div');
+        label.className = 'env-label';
+        label.textContent = env.key;
+
+        const group = document.createElement('div');
+        group.className = 'env-input-group';
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'env-input';
+        input.value = env.value || "";
+
+        const btn = document.createElement('button');
+        btn.className = 'save-btn';
+        btn.textContent = 'Save';
+
+        group.appendChild(input);
+        group.appendChild(btn);
+        item.appendChild(label);
+        item.appendChild(group);
+        envList.appendChild(item);
       });
+    } else {
+      envList.innerHTML = '<p class="muted-note">No environment variables found or accessible.</p>';
     }
   } catch (e) {
     console.error('Failed to load envs', e);
+    envList.innerHTML = '<p class="muted-note">Failed to load environment variables.</p>';
   }
 }
 
-document.querySelectorAll('.save-btn').forEach(btn => {
-  btn.addEventListener('click', async () => {
-    const item = btn.closest('.env-item');
-    const key = item.dataset.key;
-    const input = item.querySelector('.env-input');
-    const value = input.value;
+document.addEventListener('click', async (e) => {
+  if (!e.target.classList.contains('save-btn')) return;
+  const btn = e.target;
+  const item = btn.closest('.env-item');
+  const key = item.dataset.key;
+  const input = item.querySelector('.env-input');
+  const value = input.value;
 
-    btn.disabled = true;
-    input.disabled = true;
-    const originalLabel = btn.textContent;
-    btn.textContent = '...';
+  btn.disabled = true;
+  input.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = '...';
 
-    try {
-      const fd = new FormData();
-      fd.append('uuid', uuid);
-      fd.append('key', key);
-      fd.append('value', value);
-      const res = await fetch('/envs', { method: 'POST', body: fd });
-      if (res.ok) {
-        showToast(`✓ Saved ${key}`);
-        const rw = document.getElementById('restart-warning');
-        if (rw) rw.style.display = 'block';
-      } else {
-        showToast(`✗ Failed to save ${key}`, true);
-      }
-    } catch (e) {
-      showToast('✗ ' + e.message, true);
-    } finally {
-      btn.textContent = originalLabel;
-      btn.disabled = false;
-      input.disabled = false;
+  try {
+    const fd = new FormData();
+    fd.append('uuid', uuid);
+    fd.append('key', key);
+    fd.append('value', value);
+    const res = await fetch('/envs', { method: 'POST', body: fd });
+    if (res.ok) {
+      showToast(`✓ Saved ${key}`);
+      const rw = document.getElementById('restart-warning');
+      if (rw) rw.style.display = 'block';
+    } else {
+      showToast(`✗ Failed to save ${key}`, true);
     }
-  });
+  } catch (e) {
+    showToast('✗ ' + e.message, true);
+  } finally {
+    btn.textContent = originalLabel;
+    btn.disabled = false;
+    input.disabled = false;
+  }
 });
 
 // Status polling logic (reused from index.html)
@@ -281,6 +334,7 @@ let fastPollHandle = null;
 function fastRefreshAfterAction() {
   if (fastPollHandle) clearInterval(fastPollHandle);
   refreshStatus();
+  refreshLiveLogs();
   let attempts = 0;
   fastPollHandle = setInterval(() => {
     refreshStatus();
@@ -289,6 +343,163 @@ function fastRefreshAfterAction() {
       fastPollHandle = null;
     }
   }, 1500);
+}
+
+// ---- Live logs + deployment logs (applications only) ----
+const liveLogsEl = document.getElementById('live-logs');
+const liveDot = document.getElementById('live-dot');
+const liveStatus = document.getElementById('live-status');
+const liveToggle = document.getElementById('live-toggle');
+const deployPicker = document.getElementById('deployment-picker');
+const deployLogsEl = document.getElementById('deploy-logs');
+const deployReload = document.getElementById('deploy-reload');
+
+let livePaused = false;
+let liveInterval = null;
+
+function isNearBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+}
+
+async function refreshLiveLogs() {
+  if (!liveLogsEl || livePaused) return;
+  try {
+    const r = await fetch('/logs?uuid=' + encodeURIComponent(uuid) + '&lines=200');
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.error) {
+      liveStatus.textContent = 'Stale (' + (data.error || r.statusText) + ')';
+      liveDot.classList.remove('active');
+      return;
+    }
+    const wasAtBottom = isNearBottom(liveLogsEl);
+    const text = (data.logs || '').trim();
+    if (text) {
+      liveLogsEl.textContent = text;
+      liveLogsEl.classList.remove('empty');
+    } else {
+      liveLogsEl.textContent = 'No log output.';
+      liveLogsEl.classList.add('empty');
+    }
+    if (wasAtBottom) liveLogsEl.scrollTop = liveLogsEl.scrollHeight;
+    liveStatus.textContent = 'Live';
+    liveDot.classList.add('active');
+    setTimeout(() => liveDot.classList.remove('active'), 400);
+  } catch (e) {
+    liveStatus.textContent = 'Stale (' + e.message + ')';
+    liveDot.classList.remove('active');
+  }
+}
+
+function startLivePolling() {
+  if (liveInterval) clearInterval(liveInterval);
+  liveInterval = setInterval(refreshLiveLogs, 5000);
+}
+
+if (liveLogsEl) {
+  liveToggle.addEventListener('click', () => {
+    livePaused = !livePaused;
+    liveToggle.textContent = livePaused ? 'Resume' : 'Pause';
+    liveStatus.textContent = livePaused ? 'Paused' : 'Live';
+    liveDot.style.background = livePaused ? '#eab308' : '#22c55e';
+    if (!livePaused) refreshLiveLogs();
+  });
+  refreshLiveLogs();
+  startLivePolling();
+}
+
+function fmtDeployLabel(d) {
+  const when = d.created_at ? new Date(d.created_at).toLocaleString() : '';
+  const msg = (d.commit_msg || d.commit || '').slice(0, 60);
+  const icon = d.status === 'finished' ? '✓'
+             : d.status === 'failed' ? '✗'
+             : d.status === 'in_progress' ? '•'
+             : '·';
+  return `${icon} ${when}${msg ? ' — ' + msg : ''}`;
+}
+
+async function loadDeployments() {
+  if (!deployPicker) return;
+  deployPicker.disabled = true;
+  try {
+    const r = await fetch('/deployments?uuid=' + encodeURIComponent(uuid));
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.error) {
+      deployPicker.innerHTML = '<option>Failed to load</option>';
+      return;
+    }
+    const list = data.deployments || [];
+    if (list.length === 0) {
+      deployPicker.innerHTML = '<option>No deployments yet</option>';
+      return;
+    }
+    // Build options via DOM APIs so user-controlled fields (commit_msg from
+    // the Coolify API) can't inject HTML through innerHTML interpolation.
+    deployPicker.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'Select a deployment…';
+    deployPicker.appendChild(placeholder);
+    for (const d of list) {
+      const opt = document.createElement('option');
+      opt.value = d.deployment_uuid || '';
+      opt.textContent = fmtDeployLabel(d);
+      deployPicker.appendChild(opt);
+    }
+    deployPicker.disabled = false;
+  } catch (e) {
+    deployPicker.innerHTML = '<option>Error loading</option>';
+  }
+}
+
+async function loadDeploymentLogs(depUUID) {
+  if (!depUUID) {
+    deployLogsEl.textContent = 'Select a deployment to view its logs.';
+    deployLogsEl.classList.add('empty');
+    return;
+  }
+  deployLogsEl.textContent = 'Loading…';
+  deployLogsEl.classList.add('empty');
+  try {
+    const r = await fetch('/deployments?uuid=' + encodeURIComponent(uuid) +
+                          '&deployment_uuid=' + encodeURIComponent(depUUID));
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.error) {
+      deployLogsEl.textContent = 'Failed to load: ' + (data.error || r.statusText);
+      return;
+    }
+    let text = data.logs || '';
+    // Coolify stores deployment logs as a JSON array of {output,type,timestamp}.
+    // If we got one of those, format it; otherwise show as-is.
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        text = parsed.map(e => (e.output || '')).join('');
+      }
+    } catch { /* plain string */ }
+    if (text.trim()) {
+      deployLogsEl.textContent = text;
+      deployLogsEl.classList.remove('empty');
+    } else {
+      deployLogsEl.textContent = 'This deployment has no log output.';
+      deployLogsEl.classList.add('empty');
+    }
+  } catch (e) {
+    deployLogsEl.textContent = 'Error: ' + e.message;
+  }
+}
+
+if (deployPicker) {
+  deployPicker.addEventListener('change', () => loadDeploymentLogs(deployPicker.value));
+  deployReload.addEventListener('click', () => {
+    const cur = deployPicker.value;
+    loadDeployments().then(() => {
+      if (cur) {
+        deployPicker.value = cur;
+        loadDeploymentLogs(cur);
+      }
+    });
+  });
+  loadDeployments();
 }
 
 refreshStatus();

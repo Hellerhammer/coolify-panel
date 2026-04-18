@@ -17,13 +17,20 @@ User ──▶ Traefik ──▶ Authelia/Authentik (forward auth) ──▶ pan
 - Coolify itself does **not** need to be exposed — the panel reaches the API
   internally over the Coolify Docker network.
 - Every action is logged to stdout as an audit trail (user, action, UUID).
+- Per-resource **Details** page with optional env-var editing and, for
+  applications, a live log tail (auto-refreshing every 5s) plus a picker for
+  past deployment logs. Services/databases don't get log views — the Coolify
+  public API exposes no log endpoints for them.
 
 ## Setup
 
 ### 1. Create a Coolify API token
 
 In Coolify: **Keys & Tokens → API tokens → New token**.
-Scope it to the team that owns the resources you want to control. Needs write access.
+Scope it to the team that owns the resources you want to control. Needs **write**
+access. If you want to use the env-editing feature, the token additionally needs
+**`read:sensitive`** — without it, Coolify returns env variables without their
+values and the panel will show empty input fields.
 
 ### 2. Find the resource UUIDs
 
@@ -125,6 +132,5 @@ CONFIG_PATH=./config.yaml go run .
 ## What it deliberately doesn't do
 
 - No built-in login — an auth proxy is required in production
-- No resource creation or config editing — only start/stop/restart
-- No log viewer (possible via API, but expands the attack surface)
+- No resource creation 
 - No team/role hierarchy — just a flat user/group → action map per resource
