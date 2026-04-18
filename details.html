@@ -123,20 +123,12 @@
   <div class="log-controls">
     <span class="log-live-dot" id="live-dot"></span>
     <span id="live-status" style="opacity: 0.7;">Live</span>
-    <span style="opacity: 0.5;">· last 200 lines</span>
+    <input type="number" id="log-lines" value="200" min="1" max="1000" style="width: 50px; font-size: 0.8rem; padding: 0.1rem 0.3rem; border-radius: 4px; border: 1px solid currentColor; background: transparent; color: inherit;" title="Lines to fetch">
     <div class="spacer"></div>
+    <button type="button" class="log-btn" id="log-reload" title="Refresh">⟳</button>
     <button type="button" class="log-btn" id="live-toggle">Pause</button>
   </div>
   <pre class="log-output empty" id="live-logs">Loading…</pre>
-
-  <div class="section-title">Deployment Logs</div>
-  <div class="log-controls">
-    <select class="deploy-picker" id="deployment-picker" disabled>
-      <option>Loading deployments…</option>
-    </select>
-    <button type="button" class="log-btn" id="deploy-reload" title="Reload">⟳</button>
-  </div>
-  <pre class="log-output empty" id="deploy-logs">Select a deployment to view its logs.</pre>
   {{else}}
   <div class="section-title">Logs</div>
   <p class="muted-note">Live logs and deployment logs are only available for applications via the Coolify API — not for services or databases.</p>
@@ -345,17 +337,16 @@ function fastRefreshAfterAction() {
   }, 1500);
 }
 
-// ---- Live logs + deployment logs (applications only) ----
+// ---- Live logs (applications only) ----
 const liveLogsEl = document.getElementById('live-logs');
 const liveDot = document.getElementById('live-dot');
 const liveStatus = document.getElementById('live-status');
 const liveToggle = document.getElementById('live-toggle');
-const deployPicker = document.getElementById('deployment-picker');
-const deployLogsEl = document.getElementById('deploy-logs');
-const deployReload = document.getElementById('deploy-reload');
+const logLinesInput = document.getElementById('log-lines');
+const logReloadBtn = document.getElementById('log-reload');
 
 let livePaused = false;
-let liveInterval = null;
+let liveTimeout = null;
 
 function isNearBottom(el) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
@@ -363,36 +354,44 @@ function isNearBottom(el) {
 
 async function refreshLiveLogs() {
   if (!liveLogsEl || livePaused) return;
+  if (liveTimeout) clearTimeout(liveTimeout);
+
   try {
-    const r = await fetch('/logs?uuid=' + encodeURIComponent(uuid) + '&lines=200');
+    const lines = parseInt(logLinesInput.value) || 200;
+    const r = await fetch(`/logs?uuid=${encodeURIComponent(uuid)}&lines=${lines}`);
     const data = await r.json().catch(() => ({}));
+    
     if (!r.ok || data.error) {
       liveStatus.textContent = 'Stale (' + (data.error || r.statusText) + ')';
       liveDot.classList.remove('active');
-      return;
-    }
-    const wasAtBottom = isNearBottom(liveLogsEl);
-    const text = (data.logs || '').trim();
-    if (text) {
-      liveLogsEl.textContent = text;
-      liveLogsEl.classList.remove('empty');
     } else {
-      liveLogsEl.textContent = 'No log output.';
-      liveLogsEl.classList.add('empty');
+      const wasAtBottom = isNearBottom(liveLogsEl);
+      const text = (data.logs || '').trim();
+      if (text) {
+        liveLogsEl.textContent = text;
+        liveLogsEl.classList.remove('empty');
+      } else {
+        liveLogsEl.textContent = 'No log output.';
+        liveLogsEl.classList.add('empty');
+      }
+      if (wasAtBottom) liveLogsEl.scrollTop = liveLogsEl.scrollHeight;
+      liveStatus.textContent = 'Live';
+      liveDot.classList.add('active');
+      setTimeout(() => liveDot.classList.remove('active'), 400);
     }
-    if (wasAtBottom) liveLogsEl.scrollTop = liveLogsEl.scrollHeight;
-    liveStatus.textContent = 'Live';
-    liveDot.classList.add('active');
-    setTimeout(() => liveDot.classList.remove('active'), 400);
   } catch (e) {
     liveStatus.textContent = 'Stale (' + e.message + ')';
     liveDot.classList.remove('active');
+  } finally {
+    if (!livePaused) {
+      liveTimeout = setTimeout(refreshLiveLogs, 3000);
+    }
   }
 }
 
 function startLivePolling() {
-  if (liveInterval) clearInterval(liveInterval);
-  liveInterval = setInterval(refreshLiveLogs, 5000);
+  if (liveTimeout) clearTimeout(liveTimeout);
+  refreshLiveLogs();
 }
 
 if (liveLogsEl) {
@@ -401,105 +400,19 @@ if (liveLogsEl) {
     liveToggle.textContent = livePaused ? 'Resume' : 'Pause';
     liveStatus.textContent = livePaused ? 'Paused' : 'Live';
     liveDot.style.background = livePaused ? '#eab308' : '#22c55e';
-    if (!livePaused) refreshLiveLogs();
-  });
-  refreshLiveLogs();
-  startLivePolling();
-}
-
-function fmtDeployLabel(d) {
-  const when = d.created_at ? new Date(d.created_at).toLocaleString() : '';
-  const msg = (d.commit_msg || d.commit || '').slice(0, 60);
-  const icon = d.status === 'finished' ? '✓'
-             : d.status === 'failed' ? '✗'
-             : d.status === 'in_progress' ? '•'
-             : '·';
-  return `${icon} ${when}${msg ? ' — ' + msg : ''}`;
-}
-
-async function loadDeployments() {
-  if (!deployPicker) return;
-  deployPicker.disabled = true;
-  try {
-    const r = await fetch('/deployments?uuid=' + encodeURIComponent(uuid));
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok || data.error) {
-      deployPicker.innerHTML = '<option>Failed to load</option>';
-      return;
-    }
-    const list = data.deployments || [];
-    if (list.length === 0) {
-      deployPicker.innerHTML = '<option>No deployments yet</option>';
-      return;
-    }
-    // Build options via DOM APIs so user-controlled fields (commit_msg from
-    // the Coolify API) can't inject HTML through innerHTML interpolation.
-    deployPicker.replaceChildren();
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = 'Select a deployment…';
-    deployPicker.appendChild(placeholder);
-    for (const d of list) {
-      const opt = document.createElement('option');
-      opt.value = d.deployment_uuid || '';
-      opt.textContent = fmtDeployLabel(d);
-      deployPicker.appendChild(opt);
-    }
-    deployPicker.disabled = false;
-  } catch (e) {
-    deployPicker.innerHTML = '<option>Error loading</option>';
-  }
-}
-
-async function loadDeploymentLogs(depUUID) {
-  if (!depUUID) {
-    deployLogsEl.textContent = 'Select a deployment to view its logs.';
-    deployLogsEl.classList.add('empty');
-    return;
-  }
-  deployLogsEl.textContent = 'Loading…';
-  deployLogsEl.classList.add('empty');
-  try {
-    const r = await fetch('/deployments?uuid=' + encodeURIComponent(uuid) +
-                          '&deployment_uuid=' + encodeURIComponent(depUUID));
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok || data.error) {
-      deployLogsEl.textContent = 'Failed to load: ' + (data.error || r.statusText);
-      return;
-    }
-    let text = data.logs || '';
-    // Coolify stores deployment logs as a JSON array of {output,type,timestamp}.
-    // If we got one of those, format it; otherwise show as-is.
-    try {
-      const parsed = JSON.parse(text);
-      if (Array.isArray(parsed)) {
-        text = parsed.map(e => (e.output || '')).join('');
-      }
-    } catch { /* plain string */ }
-    if (text.trim()) {
-      deployLogsEl.textContent = text;
-      deployLogsEl.classList.remove('empty');
+    if (!livePaused) {
+      startLivePolling();
     } else {
-      deployLogsEl.textContent = 'This deployment has no log output.';
-      deployLogsEl.classList.add('empty');
+      if (liveTimeout) clearTimeout(liveTimeout);
     }
-  } catch (e) {
-    deployLogsEl.textContent = 'Error: ' + e.message;
-  }
-}
-
-if (deployPicker) {
-  deployPicker.addEventListener('change', () => loadDeploymentLogs(deployPicker.value));
-  deployReload.addEventListener('click', () => {
-    const cur = deployPicker.value;
-    loadDeployments().then(() => {
-      if (cur) {
-        deployPicker.value = cur;
-        loadDeploymentLogs(cur);
-      }
-    });
   });
-  loadDeployments();
+
+  logReloadBtn.addEventListener('click', () => {
+    if (liveTimeout) clearTimeout(liveTimeout);
+    refreshLiveLogs();
+  });
+
+  startLivePolling();
 }
 
 refreshStatus();

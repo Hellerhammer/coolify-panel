@@ -228,7 +228,6 @@ func main() {
 	http.HandleFunc("/status", handleStatus)
 	http.HandleFunc("/envs", handleEnvs)
 	http.HandleFunc("/logs", handleLogs)
-	http.HandleFunc("/deployments", handleDeployments)
 	http.HandleFunc("/coolify-status", handleCoolifyStatus)
 	http.HandleFunc("/favicon.ico", handleFavicon)
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
@@ -735,93 +734,4 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Write(body)
-}
-
-func handleDeployments(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "GET only", http.StatusMethodNotAllowed)
-		return
-	}
-	res, u := findAndAuthorize(w, r, r.URL.Query().Get("uuid"))
-	if res == nil {
-		return
-	}
-	if res.Kind != KindApplication {
-		http.Error(w, "deployments are only available for applications", http.StatusBadRequest)
-		return
-	}
-
-	deploymentUUID := r.URL.Query().Get("deployment_uuid")
-	var endpoint string
-	if deploymentUUID != "" {
-		endpoint = fmt.Sprintf("%s/api/v1/deployments/%s", cfg.CoolifyURL, deploymentUUID)
-	} else {
-		endpoint = fmt.Sprintf("%s/api/v1/deployments/applications/%s?skip=0&take=10", cfg.CoolifyURL, res.UUID)
-	}
-
-	resp, err := callCoolify(r.Context(), http.MethodGet, endpoint, nil, 15*time.Second)
-	w.Header().Set("Content-Type", "application/json")
-	if err != nil {
-		log.Printf("coolify deployments call failed for %s (user %s): %v", res.UUID, u.Name, err)
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": "unreachable"})
-		return
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("coolify deployments body read failed for %s: %v", res.UUID, err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("coolify deployments %d for %s (user %s): %.200s", resp.StatusCode, res.UUID, u.Name, string(body))
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": fmt.Sprintf("http %d", resp.StatusCode)})
-		return
-	}
-
-	if deploymentUUID != "" {
-		// Single deployment: extract just the fields the UI needs.
-		var full map[string]any
-		if err := json.Unmarshal(body, &full); err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "decode"})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"logs":       full["logs"],
-			"status":     full["status"],
-			"commit":     full["commit"],
-			"commit_msg": full["commit_message"],
-			"created_at": full["created_at"],
-		})
-		return
-	}
-
-	// List: slim each entry.
-	var list []map[string]any
-	if err := json.Unmarshal(body, &list); err != nil {
-		// Coolify sometimes wraps in {data: [...]}.
-		var wrap struct {
-			Data []map[string]any `json:"data"`
-		}
-		if err2 := json.Unmarshal(body, &wrap); err2 == nil {
-			list = wrap.Data
-		} else {
-			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "decode"})
-			return
-		}
-	}
-	out := make([]map[string]any, 0, len(list))
-	for _, d := range list {
-		out = append(out, map[string]any{
-			"deployment_uuid": d["deployment_uuid"],
-			"status":          d["status"],
-			"commit":          d["commit"],
-			"commit_msg":      d["commit_message"],
-			"created_at":      d["created_at"],
-		})
-	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"deployments": out})
 }
