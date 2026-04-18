@@ -21,4 +21,5 @@ config.yaml
 *.sum
 CLAUDE.md
 GEMINI.md
+settings.json
 
