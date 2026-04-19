@@ -84,6 +84,7 @@
       <button
         data-action="{{.}}"
         {{if eq . "stop"}}class="danger"{{end}}
+        hidden
       >{{.}}</button>
     {{end}}
     <a href="/details?uuid={{.UUID}}" class="details-btn">Details</a>
