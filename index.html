@@ -185,11 +185,21 @@ function applyButtonVisibility(card, bucketName) {
   });
 }
 
+// Skip overlapping polls per UUID so a single hung fetch can't stack up
+// followup requests while setInterval keeps firing.
+const statusInFlight = new Set();
+
 async function refreshStatus(card) {
   const uuid = card.dataset.uuid;
   const el = card.querySelector('.status');
+  if (statusInFlight.has(uuid)) return;
+  statusInFlight.add(uuid);
+  const ctrl = new AbortController();
+  // 12s > server-side 10s timeout, so a responsive server returns a clean
+  // 502 first; the client abort only fires when the server itself hangs.
+  const t = setTimeout(() => ctrl.abort(), 12000);
   try {
-    const r = await fetch('/status?uuid=' + encodeURIComponent(uuid));
+    const r = await fetch('/status?uuid=' + encodeURIComponent(uuid), { signal: ctrl.signal });
     const data = await r.json().catch(() => ({}));
     const s = (data.status || 'unknown').toLowerCase();
     const depLabel = deploymentLabel(data.deployment);
@@ -213,6 +223,9 @@ async function refreshStatus(card) {
     el.dataset.status = 'unknown';
     el.querySelector('.status-label').textContent = 'Unknown';
     applyButtonVisibility(card, 'unknown');
+  } finally {
+    clearTimeout(t);
+    statusInFlight.delete(uuid);
   }
 }
 function refreshAll() {

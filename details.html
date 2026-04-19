@@ -299,13 +299,21 @@ function applyButtonVisibility(bucketName) {
   });
 }
 
+let statusInFlight = false;
+
 async function refreshStatus() {
   const el = document.querySelector('.status');
+  if (statusInFlight) return;
+  statusInFlight = true;
+  const ctrl = new AbortController();
+  // 12s > server-side 10s timeout, so a responsive server returns a clean
+  // 502 first; the client abort only fires when the server itself hangs.
+  const t = setTimeout(() => ctrl.abort(), 12000);
   try {
-    const r = await fetch('/status?uuid=' + encodeURIComponent(uuid));
+    const r = await fetch('/status?uuid=' + encodeURIComponent(uuid), { signal: ctrl.signal });
     const data = await r.json().catch(() => ({}));
     const s = (data.status || 'unknown').toLowerCase();
-    
+
     const newStatus = s.split(':')[0];
     el.dataset.status = newStatus;
     el.querySelector('.status-label').textContent = humanLabel(s);
@@ -319,6 +327,9 @@ async function refreshStatus() {
     el.dataset.status = 'unknown';
     el.querySelector('.status-label').textContent = 'Unknown';
     applyButtonVisibility('unknown');
+  } finally {
+    clearTimeout(t);
+    statusInFlight = false;
   }
 }
 
