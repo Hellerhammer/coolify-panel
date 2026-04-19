@@ -312,6 +312,9 @@ async function refreshStatus() {
   const t = setTimeout(() => ctrl.abort(), 12000);
   try {
     const r = await fetch('/status?uuid=' + encodeURIComponent(uuid), { signal: ctrl.signal });
+    // Forward-auth proxy returned a 302 to its login flow — session expired.
+    // Reload so the proxy can re-authenticate the user.
+    if (r.redirected) { location.reload(); return; }
     const data = await r.json().catch(() => ({}));
     const s = (data.status || 'unknown').toLowerCase();
 
