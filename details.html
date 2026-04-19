@@ -311,10 +311,12 @@ async function refreshStatus() {
   // 502 first; the client abort only fires when the server itself hangs.
   const t = setTimeout(() => ctrl.abort(), 12000);
   try {
-    const r = await fetch('/status?uuid=' + encodeURIComponent(uuid), { signal: ctrl.signal });
-    // Forward-auth proxy returned a 302 to its login flow — session expired.
-    // Reload so the proxy can re-authenticate the user.
-    if (r.redirected) { location.reload(); return; }
+    // redirect:'manual' stops fetch from following the forward-auth 302 to
+    // the (cross-origin) login flow, which would trigger CORS errors. We
+    // detect the opaqueredirect response and reload so the proxy can
+    // re-authenticate the user via a normal page navigation.
+    const r = await fetch('/status?uuid=' + encodeURIComponent(uuid), { signal: ctrl.signal, redirect: 'manual' });
+    if (r.type === 'opaqueredirect') { location.reload(); return; }
     const data = await r.json().catch(() => ({}));
     const s = (data.status || 'unknown').toLowerCase();
 
