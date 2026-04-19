@@ -28,6 +28,7 @@
   .toast.show { opacity: 1; }
   .toast.err { background: #c0392b; }
   .empty { opacity: .6; text-align: center; padding: 2rem; }
+  .action-hint { font-size: .75rem; opacity: .55; margin-top: .6rem; }
   .status { display:flex; align-items:center; gap:.4rem; font-size:.8rem; opacity:.8; }
   .status .dot { width:.6rem; height:.6rem; border-radius:50%;
                  background: color-mix(in srgb, currentColor 40%, transparent); }
@@ -87,6 +88,7 @@
     {{end}}
     <a href="/details?uuid={{.UUID}}" class="details-btn">Details</a>
   </div>
+  <div class="action-hint">Status may take a moment to update after an action — pulling a new image can take longer.</div>
 </div>
 {{end}}
 
@@ -159,6 +161,13 @@ function humanLabel(status) {
   return 'Unknown';
 }
 
+function deploymentLabel(dep) {
+  if (dep === 'pulling') return 'Pulling image';
+  if (dep === 'in_progress') return 'Deploying';
+  if (dep === 'queued') return 'Queued';
+  return '';
+}
+
 function applyButtonVisibility(card, bucketName) {
   card.querySelectorAll('button[data-action]').forEach(btn => {
     const a = btn.dataset.action;
@@ -183,9 +192,18 @@ async function refreshStatus(card) {
     const r = await fetch('/status?uuid=' + encodeURIComponent(uuid));
     const data = await r.json().catch(() => ({}));
     const s = (data.status || 'unknown').toLowerCase();
-    el.dataset.status = s.split(':')[0];
-    el.querySelector('.status-label').textContent = humanLabel(s);
-    applyButtonVisibility(card, bucket(s));
+    const depLabel = deploymentLabel(data.deployment);
+    if (depLabel) {
+      // An active deployment overrides the container status: reuse the
+      // yellow transitional styling and disable buttons while it runs.
+      el.dataset.status = 'starting';
+      el.querySelector('.status-label').textContent = depLabel;
+      applyButtonVisibility(card, 'transitional');
+    } else {
+      el.dataset.status = s.split(':')[0];
+      el.querySelector('.status-label').textContent = humanLabel(s);
+      applyButtonVisibility(card, bucket(s));
+    }
 
     const badge = card.querySelector('.restart-badge');
     if (badge) {
@@ -202,15 +220,16 @@ function refreshAll() {
 }
 
 // Coolify's reported status lags a few seconds behind the actual action
-// (container needs to spin up/down). Poll fast for ~12s after a click so
-// the UI catches the transition, then fall back to the regular 10s cadence.
+// (container needs to spin up/down). Poll fast for ~24s after a click so
+// the UI catches transitions even when Coolify has to pull an image first,
+// then fall back to the regular 10s cadence.
 function fastRefreshAfterAction(card) {
   if (card._fastPollHandle) clearInterval(card._fastPollHandle);
   refreshStatus(card);
   let attempts = 0;
   card._fastPollHandle = setInterval(() => {
     refreshStatus(card);
-    if (++attempts >= 8) {
+    if (++attempts >= 16) {
       clearInterval(card._fastPollHandle);
       card._fastPollHandle = null;
     }

@@ -451,10 +451,48 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	_, needsRestart := restartRequired[uuid]
 	restartMu.Unlock()
 
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	out := map[string]any{
 		"status":           payload.Status,
 		"restart_required": needsRestart,
-	})
+	}
+	if res.Kind == "applications" {
+		if dep := fetchActiveDeployment(r.Context(), uuid); dep != "" {
+			out["deployment"] = dep
+		}
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// fetchActiveDeployment returns the latest deployment's status for an
+// application if it is in an active state (queued / in_progress / pulling),
+// otherwise "". Errors are swallowed — deployment info is best-effort and
+// must not disturb normal status polling.
+func fetchActiveDeployment(ctx context.Context, uuid string) string {
+	endpoint := fmt.Sprintf("%s/api/v1/deployments/applications/%s?skip=0&take=1", cfg.CoolifyURL, uuid)
+	resp, err := callCoolify(ctx, http.MethodGet, endpoint, nil, 4*time.Second)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	var items []struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &items); err != nil || len(items) == 0 {
+		return ""
+	}
+	s := strings.ToLower(strings.TrimSpace(items[0].Status))
+	switch s {
+	case "queued", "in_progress", "pulling":
+		return s
+	}
+	return ""
 }
 
 func handleAction(w http.ResponseWriter, r *http.Request) {
