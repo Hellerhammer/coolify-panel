@@ -384,24 +384,28 @@ async function refreshStats() {
 
     // Update per-core
     const grid = document.getElementById('cores-grid');
-    if (grid && data.cpu_per_core) {
-      if (grid.querySelector('.muted-note')) grid.replaceChildren();
-      
-      data.cpu_per_core.forEach((val, i) => {
-        let item = document.getElementById(`core-${i}`);
-        if (!item) {
-          item = document.createElement('div');
-          item.id = `core-${i}`;
-          item.className = 'core-item';
-          item.innerHTML = `
-            <div class="core-label-row"><span>Core ${i}</span><span class="core-val">0%</span></div>
-            <div class="core-bar-bg"><div class="core-bar-fill"></div></div>
-          `;
-          grid.appendChild(item);
-        }
-        item.querySelector('.core-val').textContent = val.toFixed(1) + '%';
-        item.querySelector('.core-bar-fill').style.width = Math.min(val, 100) + '%';
-      });
+    if (grid) {
+      if (data.cpu_per_core && data.cpu_per_core.length > 0) {
+        if (grid.querySelector('.muted-note')) grid.replaceChildren();
+        
+        data.cpu_per_core.forEach((val, i) => {
+          let item = document.getElementById(`core-${i}`);
+          if (!item) {
+            item = document.createElement('div');
+            item.id = `core-${i}`;
+            item.className = 'core-item';
+            item.innerHTML = `
+              <div class="core-label-row"><span>Core ${i}</span><span class="core-val">0%</span></div>
+              <div class="core-bar-bg"><div class="core-bar-fill"></div></div>
+            `;
+            grid.appendChild(item);
+          }
+          item.querySelector('.core-val').textContent = val.toFixed(1) + '%';
+          item.querySelector('.core-bar-fill').style.width = Math.min(val, 100) + '%';
+        });
+      } else {
+        grid.innerHTML = '<p class="muted-note">Per-core stats not available from Docker host.</p>';
+      }
     }
   } catch (e) {
     console.error('Metrics fetch failed', e);

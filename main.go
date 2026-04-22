@@ -1147,7 +1147,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Calculate per-core CPU
-	var perCore []float64
+	perCore := []float64{}
 	if systemDelta > 0.0 && len(ds.CPUStats.CPUUsage.PercpuUsage) > 0 && len(ds.CPUStats.CPUUsage.PercpuUsage) == len(ds.PreCPUStats.CPUUsage.PercpuUsage) {
 		for i := range ds.CPUStats.CPUUsage.PercpuUsage {
 			coreDelta := float64(ds.CPUStats.CPUUsage.PercpuUsage[i]) - float64(ds.PreCPUStats.CPUUsage.PercpuUsage[i])
