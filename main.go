@@ -1192,6 +1192,17 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	defer statsResp.Body.Close()
 
+	if statsResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(statsResp.Body, 512))
+		http.Error(w, fmt.Sprintf("docker api error (status %d): %s", statsResp.StatusCode, string(body)), http.StatusBadGateway)
+		return
+	}
+
+	type netStats struct {
+		RxBytes uint64 `json:"rx_bytes"`
+		TxBytes uint64 `json:"tx_bytes"`
+	}
+
 	var ds struct {
 		CPUStats struct {
 			CPUUsage struct {
@@ -1216,14 +1227,11 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 			} `json:"stats"`
 			Limit uint64 `json:"limit"`
 		} `json:"memory_stats"`
-		Networks map[string]struct {
-			RxBytes uint64 `json:"rx_bytes"`
-			TxBytes uint64 `json:"tx_bytes"`
-		} `json:"networks"`
-		Network struct {
-			RxBytes uint64 `json:"rx_bytes"`
-			TxBytes uint64 `json:"tx_bytes"`
-		} `json:"network"`
+		Networks     map[string]netStats `json:"networks"`
+		NetworkMap   map[string]netStats `json:"network"`
+		NetStatsMap  map[string]netStats `json:"network_stats"`
+		Network      netStats            `json:"network"`
+		NetworkStats netStats            `json:"network_stats"`
 	}
 
 	if err := json.NewDecoder(statsResp.Body).Decode(&ds); err != nil {
@@ -1266,14 +1274,27 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 
 	// Calculate Network
 	var rx, tx uint64
-	if len(ds.Networks) > 0 {
-		for _, n := range ds.Networks {
-			rx += n.RxBytes
-			tx += n.TxBytes
-		}
-	} else {
+	// Sum all possible network maps
+	for _, n := range ds.Networks {
+		rx += n.RxBytes
+		tx += n.TxBytes
+	}
+	for _, n := range ds.NetworkMap {
+		rx += n.RxBytes
+		tx += n.TxBytes
+	}
+	for _, n := range ds.NetStatsMap {
+		rx += n.RxBytes
+		tx += n.TxBytes
+	}
+	// Add single object fallbacks if still 0
+	if rx == 0 && tx == 0 {
 		rx = ds.Network.RxBytes
 		tx = ds.Network.TxBytes
+	}
+	if rx == 0 && tx == 0 {
+		rx = ds.NetworkStats.RxBytes
+		tx = ds.NetworkStats.TxBytes
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
