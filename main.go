@@ -700,6 +700,8 @@ func handleEnvsPost(w http.ResponseWriter, r *http.Request, u user, res *Resourc
 	restartRequired[res.UUID] = time.Now()
 	restartMu.Unlock()
 
+	log.Printf("audit user=%s env_save key=%s uuid=%s", u.Name, key, res.UUID)
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
@@ -839,6 +841,8 @@ func handleConfigFilePost(w http.ResponseWriter, r *http.Request, u user, res *R
 	restartMu.Lock()
 	restartRequired[res.UUID] = time.Now()
 	restartMu.Unlock()
+
+	log.Printf("audit user=%s config_save file=%s uuid=%s", u.Name, filePath, res.UUID)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
@@ -1049,10 +1053,12 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		logs, err := dockerContainerLogs(r.Context(), res.DockerHost, res.UUID, lines)
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
-			log.Printf("docker logs failed for %s (host=%s user=%s): %v", res.UUID, res.DockerHost, u.Name, err)
 			status := http.StatusBadGateway
-			if strings.Contains(err.Error(), "not found") {
+			isNotFound := strings.Contains(err.Error(), "not found")
+			if isNotFound {
 				status = http.StatusNotFound
+			} else {
+				log.Printf("docker logs failed for %s (host=%s user=%s): %v", res.UUID, res.DockerHost, u.Name, err)
 			}
 			w.WriteHeader(status)
 			_ = json.NewEncoder(w).Encode(map[string]any{"logs": "", "error": err.Error()})
