@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"embed"
 	"encoding/binary"
@@ -38,8 +40,9 @@ type Resource struct {
 	AllowedUsers  []string     `yaml:"allowed_users"`  // usernames from Remote-User
 	AllowedGroups []string     `yaml:"allowed_groups"` // groups from Remote-Groups
 	Actions       []string     `yaml:"actions"`        // subset of: restart, start, stop
-	EditableEnvs  []string     `yaml:"editable_envs"`  // environment variables allowed to be edited
+	EditableEnvs  []string     `yaml:"editable_envs"`   // environment variables allowed to be edited
 	ExposeAllEnvs bool         `yaml:"expose_all_envs"` // if true, all environment variables are editable
+	ConfigFiles   []string     `yaml:"config_files"`    // paths to config files allowed to be edited
 	// Optional Docker host this resource's container runs on, e.g.
 	// "tcp://docker-proxy:2375" or "tcp://192.168.1.50:2375". Intended for
 	// future direct-Docker features; no handler consumes this yet. Leaving
@@ -228,6 +231,7 @@ func main() {
 	http.HandleFunc("/action", handleAction)
 	http.HandleFunc("/status", handleStatus)
 	http.HandleFunc("/envs", handleEnvs)
+	http.HandleFunc("/config-file", handleConfigFile)
 	http.HandleFunc("/logs", handleLogs)
 	http.HandleFunc("/stats", handleStats)
 	http.HandleFunc("/coolify-status", handleCoolifyStatus)
@@ -700,6 +704,138 @@ func handleEnvsPost(w http.ResponseWriter, r *http.Request, u user, res *Resourc
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
+func handleConfigFile(w http.ResponseWriter, r *http.Request) {
+	uuid := r.URL.Query().Get("uuid")
+	if uuid == "" {
+		uuid = r.FormValue("uuid")
+	}
+	res, u := findAndAuthorize(w, r, uuid)
+	if res == nil {
+		return
+	}
+
+	if res.DockerHost == "" {
+		http.Error(w, "config file editing requires docker_host", http.StatusBadRequest)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		handleConfigFileGet(w, r, u, res)
+	} else if r.Method == http.MethodPost {
+		handleConfigFilePost(w, r, u, res)
+	} else {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleConfigFileGet(w http.ResponseWriter, r *http.Request, u user, res *Resource) {
+	filePath := r.URL.Query().Get("file")
+	if !slices.Contains(res.ConfigFiles, filePath) {
+		http.Error(w, "config file not allowed", http.StatusForbidden)
+		return
+	}
+
+	id, base, err := getContainerID(r.Context(), res.DockerHost, res.UUID)
+	if err != nil {
+		http.Error(w, "failed to find container: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	archiveURL := base + "/containers/" + id + "/archive?path=" + url.QueryEscape(filePath)
+	resp, err := dockerDo(r.Context(), http.MethodGet, archiveURL, nil, 15*time.Second)
+	if err != nil {
+		http.Error(w, "failed to get archive: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		http.Error(w, "docker error: "+string(body), http.StatusBadGateway)
+		return
+	}
+
+	tr := tar.NewReader(resp.Body)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			http.Error(w, "tar read error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !hdr.FileInfo().IsDir() {
+			content, err := io.ReadAll(tr)
+			if err != nil {
+				http.Error(w, "read error: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"content": string(content)})
+			return
+		}
+	}
+	http.Error(w, "file not found in archive", http.StatusNotFound)
+}
+
+func handleConfigFilePost(w http.ResponseWriter, r *http.Request, u user, res *Resource) {
+	filePath := r.FormValue("file")
+	if !slices.Contains(res.ConfigFiles, filePath) {
+		http.Error(w, "config file not allowed", http.StatusForbidden)
+		return
+	}
+	content := r.FormValue("content")
+
+	id, base, err := getContainerID(r.Context(), res.DockerHost, res.UUID)
+	if err != nil {
+		http.Error(w, "failed to find container: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	hdr := &tar.Header{
+		Name:    strings.TrimPrefix(filePath, "/"),
+		Mode:    0644,
+		Size:    int64(len(content)),
+		ModTime: time.Now(),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		http.Error(w, "tar header error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := tw.Write([]byte(content)); err != nil {
+		http.Error(w, "tar write error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := tw.Close(); err != nil {
+		http.Error(w, "tar close error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	archiveURL := base + "/containers/" + id + "/archive?path=/"
+	resp, err := dockerDo(r.Context(), http.MethodPut, archiveURL, &buf, 15*time.Second)
+	if err != nil {
+		http.Error(w, "docker put error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		http.Error(w, "docker put failed: "+string(body), http.StatusBadGateway)
+		return
+	}
+
+	restartMu.Lock()
+	restartRequired[res.UUID] = time.Now()
+	restartMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
 // findAndAuthorize does the user/resource/whitelist dance shared by every
 // resource-scoped handler. On failure it writes the HTTP error and returns nil.
 func findAndAuthorize(w http.ResponseWriter, r *http.Request, uuid string) (*Resource, user) {
@@ -740,40 +876,46 @@ func dockerAPIBase(host string) (string, error) {
 	return "http://" + u.Host, nil
 }
 
+// getContainerID finds the container ID for a given resource UUID on a
+// specific Docker host. Returns container ID, base URL, and error.
+func getContainerID(ctx context.Context, host, uuid string) (string, string, error) {
+	base, err := dockerAPIBase(host)
+	if err != nil {
+		return "", "", err
+	}
+
+	filters, _ := json.Marshal(map[string][]string{"name": {uuid}})
+	listURL := base + "/containers/json?all=true&filters=" + url.QueryEscape(string(filters))
+	listResp, err := dockerDo(ctx, http.MethodGet, listURL, nil, 8*time.Second)
+	if err != nil {
+		return "", "", fmt.Errorf("docker list: %w", err)
+	}
+	defer listResp.Body.Close()
+
+	if listResp.StatusCode < 200 || listResp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(listResp.Body, 512))
+		return "", "", fmt.Errorf("docker list http %d: %s", listResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var containers []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&containers); err != nil {
+		return "", "", fmt.Errorf("docker list decode: %w", err)
+	}
+	if len(containers) == 0 {
+		return "", "", fmt.Errorf("no container found for uuid %s", uuid)
+	}
+	return containers[0].ID, base, nil
+}
+
 // dockerContainerLogs fetches the tail of a container's logs via the Docker
 // Engine API, finding the container by Coolify's UUID-prefixed name. Returns
 // a plain-text string suitable for the existing log-view UI.
 func dockerContainerLogs(ctx context.Context, host, uuid string, lines int) (string, error) {
-	base, err := dockerAPIBase(host)
+	id, base, err := getContainerID(ctx, host, uuid)
 	if err != nil {
 		return "", err
-	}
-
-	// Find the container: Coolify names containers with the application/
-	// service/database UUID as a prefix, so a name-substring filter finds it.
-	filters, _ := json.Marshal(map[string][]string{"name": {uuid}})
-	listURL := base + "/containers/json?all=true&filters=" + url.QueryEscape(string(filters))
-	listResp, err := dockerDo(ctx, http.MethodGet, listURL, 8*time.Second)
-	if err != nil {
-		return "", fmt.Errorf("docker list: %w", err)
-	}
-	defer listResp.Body.Close()
-	if listResp.StatusCode < 200 || listResp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(listResp.Body, 512))
-		return "", fmt.Errorf("docker list http %d: %s", listResp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var containers []struct {
-		ID    string   `json:"Id"`
-		Names []string `json:"Names"`
-	}
-	if err := json.NewDecoder(listResp.Body).Decode(&containers); err != nil {
-		return "", fmt.Errorf("docker list decode: %w", err)
-	}
-	if len(containers) == 0 {
-		return "", fmt.Errorf("no container found for uuid %s", uuid)
-	}
-	if len(containers) > 1 {
-		log.Printf("docker logs: %d containers match uuid %s, using first (%s)", len(containers), uuid, containers[0].ID[:12])
 	}
 
 	// Fetch logs. Non-TTY containers (the default) return a multiplexed
@@ -782,8 +924,8 @@ func dockerContainerLogs(ctx context.Context, host, uuid string, lines int) (str
 	// a third round-trip, we always try to demultiplex and fall back to
 	// the raw bytes if the stream doesn't look framed.
 	logsURL := fmt.Sprintf("%s/containers/%s/logs?stdout=1&stderr=1&tail=%d&timestamps=0",
-		base, containers[0].ID, lines)
-	logsResp, err := dockerDo(ctx, http.MethodGet, logsURL, 10*time.Second)
+		base, id, lines)
+	logsResp, err := dockerDo(ctx, http.MethodGet, logsURL, nil, 10*time.Second)
 	if err != nil {
 		return "", fmt.Errorf("docker logs: %w", err)
 	}
@@ -799,16 +941,19 @@ func dockerContainerLogs(ctx context.Context, host, uuid string, lines int) (str
 	return demuxDockerLogs(raw), nil
 }
 
-// dockerDo issues an authenticated-free GET against the proxy with a context
-// deadline wired up the same way callCoolify does it.
-func dockerDo(ctx context.Context, method, endpoint string, timeout time.Duration) (*http.Response, error) {
+// dockerDo issues an request against the proxy with a context deadline
+// wired up the same way callCoolify does it.
+func dockerDo(ctx context.Context, method, endpoint string, body io.Reader, timeout time.Duration) (*http.Response, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
-	req, err := http.NewRequestWithContext(cctx, method, endpoint, nil)
+	req, err := http.NewRequestWithContext(cctx, method, endpoint, body)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/x-tar")
+	}
 	resp, err := dockerClient.Do(req)
 	if err != nil {
 		cancel()
@@ -936,33 +1081,14 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	base, err := dockerAPIBase(res.DockerHost)
+	id, base, err := getContainerID(r.Context(), res.DockerHost, res.UUID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// We need the container ID. We can use the same logic as dockerContainerLogs
-	// but let's keep it simple and just do the list + stats call.
-	filters, _ := json.Marshal(map[string][]string{"name": {res.UUID}})
-	listURL := base + "/containers/json?all=true&filters=" + url.QueryEscape(string(filters))
-	listResp, err := dockerDo(r.Context(), http.MethodGet, listURL, 5*time.Second)
-	if err != nil {
-		http.Error(w, "docker unreachable", http.StatusBadGateway)
-		return
-	}
-	defer listResp.Body.Close()
-
-	var containers []struct {
-		ID string `json:"Id"`
-	}
-	if err := json.NewDecoder(listResp.Body).Decode(&containers); err != nil || len(containers) == 0 {
-		http.Error(w, "container not found", http.StatusNotFound)
-		return
-	}
-
-	statsURL := fmt.Sprintf("%s/containers/%s/stats?stream=false", base, containers[0].ID)
-	statsResp, err := dockerDo(r.Context(), http.MethodGet, statsURL, 10*time.Second)
+	statsURL := fmt.Sprintf("%s/containers/%s/stats?stream=false", base, id)
+	statsResp, err := dockerDo(r.Context(), http.MethodGet, statsURL, nil, 10*time.Second)
 	if err != nil {
 		http.Error(w, "stats failed", http.StatusBadGateway)
 		return
@@ -972,14 +1098,16 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	var ds struct {
 		CPUStats struct {
 			CPUUsage struct {
-				TotalUsage uint64 `json:"total_usage"`
+				TotalUsage  uint64   `json:"total_usage"`
+				PercpuUsage []uint64 `json:"percpu_usage"`
 			} `json:"cpu_usage"`
 			SystemCPUUsage uint64 `json:"system_cpu_usage"`
 			OnlineCPUs     uint64 `json:"online_cpus"`
 		} `json:"cpu_stats"`
 		PreCPUStats struct {
 			CPUUsage struct {
-				TotalUsage uint64 `json:"total_usage"`
+				TotalUsage  uint64   `json:"total_usage"`
+				PercpuUsage []uint64 `json:"percpu_usage"`
 			} `json:"cpu_usage"`
 			SystemCPUUsage uint64 `json:"system_cpu_usage"`
 			OnlineCPUs     uint64 `json:"online_cpus"`
@@ -1007,12 +1135,29 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	systemDelta := float64(ds.CPUStats.SystemCPUUsage) - float64(ds.PreCPUStats.SystemCPUUsage)
 	onlineCPUs := float64(ds.CPUStats.OnlineCPUs)
 	if onlineCPUs == 0 {
+		onlineCPUs = float64(len(ds.CPUStats.CPUUsage.PercpuUsage))
+	}
+	if onlineCPUs == 0 {
 		onlineCPUs = 1
 	}
 
 	cpuPercent := 0.0
 	if systemDelta > 0.0 && cpuDelta > 0.0 {
 		cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
+	}
+
+	// Calculate per-core CPU
+	var perCore []float64
+	if systemDelta > 0.0 && len(ds.CPUStats.CPUUsage.PercpuUsage) > 0 && len(ds.CPUStats.CPUUsage.PercpuUsage) == len(ds.PreCPUStats.CPUUsage.PercpuUsage) {
+		for i := range ds.CPUStats.CPUUsage.PercpuUsage {
+			coreDelta := float64(ds.CPUStats.CPUUsage.PercpuUsage[i]) - float64(ds.PreCPUStats.CPUUsage.PercpuUsage[i])
+			if coreDelta > 0 {
+				p := (coreDelta / systemDelta) * onlineCPUs * 100.0
+				perCore = append(perCore, p)
+			} else {
+				perCore = append(perCore, 0.0)
+			}
+		}
 	}
 
 	// Calculate Memory (Usage - Cache)
@@ -1027,6 +1172,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cpu_percent":  cpuPercent,
+		"cpu_per_core": perCore,
 		"memory_usage": memUsage,
 		"memory_limit": ds.MemoryStats.Limit,
 		"network_rx":   rx,

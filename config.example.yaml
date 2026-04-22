@@ -27,6 +27,7 @@ resources:
     allowed_groups: ["gamers"]
     actions: [restart, start, stop]
     expose_all_envs: true
+    # config_files: ["/etc/nginx/nginx.conf"]
     # editable_envs: ["MY_APP_VAR", "ANOTHER_VAR"]
     # Optional: Docker host this resource's container lives on. When set,
     # logs are pulled directly via the Docker Engine API instead of via
