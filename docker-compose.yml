@@ -41,6 +41,9 @@ services:
       # Everything else stays at the image default (0 = denied).
       CONTAINERS: 1
       POST: 1
+      TIMEOUT_CONNECT: "5s"
+      TIMEOUT_CLIENT: "1m"
+      TIMEOUT_SERVER: "1m"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     healthcheck:
