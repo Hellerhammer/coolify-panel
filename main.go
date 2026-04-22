@@ -1220,6 +1220,10 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 			RxBytes uint64 `json:"rx_bytes"`
 			TxBytes uint64 `json:"tx_bytes"`
 		} `json:"networks"`
+		Network struct {
+			RxBytes uint64 `json:"rx_bytes"`
+			TxBytes uint64 `json:"tx_bytes"`
+		} `json:"network"`
 	}
 
 	if err := json.NewDecoder(statsResp.Body).Decode(&ds); err != nil {
@@ -1262,9 +1266,14 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 
 	// Calculate Network
 	var rx, tx uint64
-	for _, n := range ds.Networks {
-		rx += n.RxBytes
-		tx += n.TxBytes
+	if len(ds.Networks) > 0 {
+		for _, n := range ds.Networks {
+			rx += n.RxBytes
+			tx += n.TxBytes
+		}
+	} else {
+		rx = ds.Network.RxBytes
+		tx = ds.Network.TxBytes
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

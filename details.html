@@ -198,11 +198,11 @@
         <div class="metric-sub" id="metric-mem-limit">Limit: 0 B</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Network Rx</div>
+        <div class="metric-label">Download</div>
         <div class="metric-value" id="metric-rx">0 B</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Network Tx</div>
+        <div class="metric-label">Upload</div>
         <div class="metric-value" id="metric-tx">0 B</div>
       </div>
     </div>
@@ -227,9 +227,11 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
-    document.getElementById(btn.dataset.target).classList.add('active');
+    const target = btn.dataset.target;
+    document.getElementById(target).classList.add('active');
     
-    if (btn.dataset.target === 'tab-metrics') refreshStats();
+    if (target === 'tab-metrics') refreshStats();
+    if (target === 'tab-logs') refreshLiveLogs();
   });
 });
 
@@ -519,7 +521,8 @@ function isNearBottom(el) {
 }
 
 async function refreshLiveLogs() {
-  if (!liveLogsEl || livePaused) return;
+  const logsPane = document.getElementById('tab-logs');
+  if (!logsPane || !logsPane.classList.contains('active') || livePaused) return;
   if (liveTimeout) clearTimeout(liveTimeout);
 
   try {
