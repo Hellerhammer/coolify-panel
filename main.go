@@ -59,6 +59,7 @@ type Config struct {
 	// If empty, the button is not rendered.
 	LogoutURL string `yaml:"logout_url"`
 	// If true, dev mode lets you pass ?user=alice&groups=admins instead of auth headers.
+	// Requires ALLOW_INSECURE_DEV_MODE=true environment variable.
 	DevMode bool `yaml:"dev_mode"`
 }
 
@@ -219,22 +220,26 @@ func main() {
 		log.Fatal("coolify_url and coolify_token are required")
 	}
 
+	if cfg.DevMode && os.Getenv("ALLOW_INSECURE_DEV_MODE") != "true" {
+		log.Fatal("DevMode is enabled in config but ALLOW_INSECURE_DEV_MODE=true is missing. Refusing to start for safety.")
+	}
+
 	validateConfig()
 	startMapCleanup()
 
 	indexTmpl = template.Must(template.ParseFS(tmplFS, "index.html"))
 	detailsTmpl = template.Must(template.ParseFS(tmplFS, "details.html"))
 
-	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/logout", handleLogout)
-	http.HandleFunc("/details", handleDetails)
-	http.HandleFunc("/action", handleAction)
-	http.HandleFunc("/status", handleStatus)
-	http.HandleFunc("/envs", handleEnvs)
-	http.HandleFunc("/config-file", handleConfigFile)
-	http.HandleFunc("/logs", handleLogs)
-	http.HandleFunc("/stats", handleStats)
-	http.HandleFunc("/coolify-status", handleCoolifyStatus)
+	http.HandleFunc("/", secure(handleIndex))
+	http.HandleFunc("/logout", secure(handleLogout))
+	http.HandleFunc("/details", secure(handleDetails))
+	http.HandleFunc("/action", secure(handleAction))
+	http.HandleFunc("/status", secure(handleStatus))
+	http.HandleFunc("/envs", secure(handleEnvs))
+	http.HandleFunc("/config-file", secure(handleConfigFile))
+	http.HandleFunc("/logs", secure(handleLogs))
+	http.HandleFunc("/stats", secure(handleStats))
+	http.HandleFunc("/coolify-status", secure(handleCoolifyStatus))
 	http.HandleFunc("/favicon.ico", handleFavicon)
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 
@@ -244,6 +249,32 @@ func main() {
 	}
 	log.Printf("listening on %s (dev_mode=%v, %d resources, coolify_url=%s)", addr, cfg.DevMode, len(cfg.Resources), cfg.CoolifyURL)
 	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+// secure wraps an http.HandlerFunc with common security checks:
+// 1. CSRF protection via Origin/Referer check for state-changing requests
+func secure(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// CSRF protection for POST, PUT, PATCH, DELETE
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				origin = r.Header.Get("Referer")
+			}
+			if origin != "" {
+				u, err := url.Parse(origin)
+				// We expect the Origin/Referer host to match the request's Host header
+				// which is set by the proxy (Traefik) to the panel's FQDN.
+				if err != nil || u.Host != r.Host {
+					log.Printf("audit security=csrf_violation from=%s origin=%q host=%q path=%s", r.RemoteAddr, origin, r.Host, r.URL.Path)
+					http.Error(w, "Forbidden: CSRF check failed", http.StatusForbidden)
+					return
+				}
+			}
+		}
+
+		next(w, r)
+	}
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -416,8 +447,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	endpoint := fmt.Sprintf("%s/api/v1/%s/%s", cfg.CoolifyURL, res.Kind, uuid)
-	resp, err := callCoolify(r.Context(), http.MethodGet, endpoint, nil, 10*time.Second)
+	status, err := fetchResourceStatus(r.Context(), res)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		log.Printf("coolify status call failed for %s (user %s): %v", uuid, u.Name, err)
@@ -425,28 +455,8 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
 		return
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("coolify status body read failed for %s: %v", uuid, err)
-	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("coolify status %d for %s (user %s): %.200s", resp.StatusCode, uuid, u.Name, string(body))
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
-		return
-	}
-
-	var payload struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil || payload.Status == "" {
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
-		return
-	}
-
-	s := strings.ToLower(payload.Status)
+	s := strings.ToLower(status)
 	if strings.HasPrefix(s, "starting") || strings.HasPrefix(s, "restarting") {
 		restartMu.Lock()
 		delete(restartRequired, uuid)
@@ -458,7 +468,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	restartMu.Unlock()
 
 	out := map[string]any{
-		"status":           payload.Status,
+		"status":           status,
 		"restart_required": needsRestart,
 	}
 	if res.Kind == "applications" {
@@ -467,6 +477,32 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+func fetchResourceStatus(ctx context.Context, res *Resource) (string, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/%s/%s", cfg.CoolifyURL, res.Kind, res.UUID)
+	resp, err := callCoolify(ctx, http.MethodGet, endpoint, nil, 10*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("http %d: %s", resp.StatusCode, string(body))
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Status == "" {
+		return "", fmt.Errorf("invalid response")
+	}
+	return payload.Status, nil
 }
 
 // fetchActiveDeployment returns the latest deployment's status for an
@@ -730,10 +766,28 @@ func handleConfigFile(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func isStatusHealthy(s string) bool {
+	s = strings.ToLower(s)
+	// Coolify status "running" (no healthcheck) or "running:healthy" (healthy)
+	return s == "running" || s == "running:healthy"
+}
+
 func handleConfigFileGet(w http.ResponseWriter, r *http.Request, u user, res *Resource) {
 	filePath := r.URL.Query().Get("file")
 	if !slices.Contains(res.ConfigFiles, filePath) {
 		http.Error(w, "config file not allowed", http.StatusForbidden)
+		return
+	}
+
+	// Verify container is healthy via Coolify status before attempting Docker access.
+	// This prevents errors when trying to read from a restarting/dead container.
+	status, err := fetchResourceStatus(r.Context(), res)
+	if err == nil && !isStatusHealthy(status) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "Container is " + status + ". Config files can only be read when the container is healthy.",
+		})
 		return
 	}
 
@@ -792,6 +846,17 @@ func handleConfigFilePost(w http.ResponseWriter, r *http.Request, u user, res *R
 		return
 	}
 	content := r.FormValue("content")
+
+	// Verify container is healthy via Coolify status before attempting Docker access.
+	status, err := fetchResourceStatus(r.Context(), res)
+	if err == nil && !isStatusHealthy(status) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "Container is " + status + ". Config files can only be saved when the container is healthy.",
+		})
+		return
+	}
 
 	id, base, err := getContainerID(r.Context(), res.DockerHost, res.UUID)
 	if err != nil {

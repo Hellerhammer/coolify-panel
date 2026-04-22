@@ -17,10 +17,12 @@ User ──▶ Traefik ──▶ Authelia/Authentik (forward auth) ──▶ pan
 - Coolify itself does **not** need to be exposed — the panel reaches the API
   internally over the Coolify Docker network.
 - Every action is logged to stdout as an audit trail (user, action, UUID).
-- Per-resource **Details** page with optional env-var editing and, for
-  applications, a live log tail (auto-refreshing every 5s) plus a picker for
-  past deployment logs. Services/databases don't get log views — the Coolify
-  public API exposes no log endpoints for them.
+- Per-resource **Details** page with:
+  - **Environment variables:** optional env-var editing (application-only).
+  - **Logs:** for applications, a live log tail (auto-refreshing every 5s) plus a picker for past deployment logs.
+  - **Stats:** live container metrics (CPU, Memory, Network) when `docker_host` is configured.
+  - **Configuration Files:** editing of specific config files directly within the container when `docker_host` is configured.
+- Services and databases do not get log views or env editing through the Coolify API, but can get logs and stats if a `docker_host` is provided.
 
 ## Setup
 
@@ -50,6 +52,10 @@ See `config.example.yaml`. Per resource:
   allowed_users: ["alice"]        # matched against Remote-User
   allowed_groups: ["gamers"]      # matched against Remote-Groups (comma-separated)
   actions: [restart, start, stop] # subset
+  expose_all_envs: true           # allows editing all environment variables
+  # editable_envs: ["KEY1", "KEY2"] # OR: only allow specific variables
+  # config_files: ["/path/in/container/config.json"] # requires docker_host
+  # docker_host: "tcp://docker-proxy:2375" # enables logs for svc/db, stats, and file editing
 ```
 
 ### 4. Traefik + Authelia
@@ -77,15 +83,20 @@ into the container at `/config/config.yaml` — add a Persistent Storage entry i
 Coolify mapping a host path (or volume) to `/config`, and put `config.yaml`
 there. Never commit the config with the token embedded.
 
-### 5a. Optional: direct Docker log viewing
+### 5a. Optional: direct Docker integration (logs, stats, config files)
 
 The bundled `docker-compose.yml` also starts a read-only Docker socket proxy
 ([Tecnativa's](https://github.com/Tecnativa/docker-socket-proxy)). Setting
-`docker_host: "tcp://docker-proxy:2375"` on a resource in `config.yaml` makes
-the panel pull logs straight from the Docker Engine API for that resource
-instead of going through Coolify. This is the only way to see logs for
-**services** and **databases** — Coolify's public API has no log endpoint for
-those. For applications, it also works and skips the Coolify round-trip.
+`docker_host: "tcp://docker-proxy:2375"` on a resource in `config.yaml` has several benefits:
+
+1.  **Logs for all kinds:** The panel pulls logs straight from the Docker Engine API.
+    This is the only way to see logs for **services** and **databases**, as Coolify's
+    public API has no log endpoint for them.
+2.  **Live Stats:** Enables real-time CPU, Memory, and Network usage metrics in the
+    Details page.
+3.  **Config File Editing:** Allows users to edit specific files inside the container
+    (defined in `config_files`). The panel uses the Docker archive API to read/write
+    these files without needing SSH or volume mounts on the panel itself.
 
 Remote hosts work the same way: run a socket proxy on that host and use
 `docker_host: "tcp://<host-ip>:2375"`. Never expose the raw Docker socket
@@ -148,5 +159,5 @@ CONFIG_PATH=./config.yaml go run .
 ## What it deliberately doesn't do
 
 - No built-in login — an auth proxy is required in production
-- No resource creation 
+- No resource creation (limited editing of environment variables and specific config files is supported)
 - No team/role hierarchy — just a flat user/group → action map per resource

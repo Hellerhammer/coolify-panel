@@ -470,6 +470,7 @@ async function refreshStatus() {
 
     const newStatus = s.split(':')[0];
     el.dataset.status = newStatus;
+    el.dataset.fullStatus = s;
     el.querySelector('.status-label').textContent = humanLabel(s);
     applyButtonVisibility(bucket(s));
 
@@ -586,10 +587,24 @@ const configReload = document.getElementById('config-reload');
 const configEditor = document.getElementById('config-editor');
 const configSave = document.getElementById('config-save');
 
+function isHealthy() {
+  const statusEl = document.querySelector('.status');
+  const s = (statusEl.dataset.fullStatus || 'unknown').toLowerCase();
+  return s === 'running' || s === 'running:healthy';
+}
+
 async function loadConfigFile() {
   if (!configEditor || !configPicker) return;
   const file = configPicker.value;
   if (!file) return;
+
+  if (!isHealthy()) {
+    const statusEl = document.querySelector('.status');
+    const s = statusEl.dataset.fullStatus || 'unknown';
+    configEditor.value = `Container is currently "${s}".\nConfig files can only be accessed when the container is healthy.`;
+    configEditor.disabled = true;
+    return;
+  }
 
   configEditor.disabled = true;
   configEditor.value = 'Loading...';
