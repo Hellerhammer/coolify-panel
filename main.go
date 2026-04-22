@@ -737,7 +737,11 @@ func handleConfigFileGet(w http.ResponseWriter, r *http.Request, u user, res *Re
 
 	id, base, err := getContainerID(r.Context(), res.DockerHost, res.UUID)
 	if err != nil {
-		http.Error(w, "failed to find container: "+err.Error(), http.StatusBadGateway)
+		status := http.StatusBadGateway
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		http.Error(w, "failed to find container: "+err.Error(), status)
 		return
 	}
 
@@ -751,7 +755,7 @@ func handleConfigFileGet(w http.ResponseWriter, r *http.Request, u user, res *Re
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		http.Error(w, "docker error: "+string(body), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("docker api error (status %d): %s", resp.StatusCode, string(body)), http.StatusBadGateway)
 		return
 	}
 
@@ -789,7 +793,11 @@ func handleConfigFilePost(w http.ResponseWriter, r *http.Request, u user, res *R
 
 	id, base, err := getContainerID(r.Context(), res.DockerHost, res.UUID)
 	if err != nil {
-		http.Error(w, "failed to find container: "+err.Error(), http.StatusBadGateway)
+		status := http.StatusBadGateway
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		http.Error(w, "failed to find container: "+err.Error(), status)
 		return
 	}
 
@@ -817,14 +825,14 @@ func handleConfigFilePost(w http.ResponseWriter, r *http.Request, u user, res *R
 	archiveURL := base + "/containers/" + id + "/archive?path=/"
 	resp, err := dockerDo(r.Context(), http.MethodPut, archiveURL, &buf, 15*time.Second)
 	if err != nil {
-		http.Error(w, "docker put error: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "docker put request failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		http.Error(w, "docker put failed: "+string(body), http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("docker api error (status %d): %s", resp.StatusCode, string(body)), http.StatusBadGateway)
 		return
 	}
 
@@ -894,19 +902,33 @@ func getContainerID(ctx context.Context, host, uuid string) (string, string, err
 
 	if listResp.StatusCode < 200 || listResp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(listResp.Body, 512))
-		return "", "", fmt.Errorf("docker list http %d: %s", listResp.StatusCode, strings.TrimSpace(string(body)))
+		return "", "", fmt.Errorf("docker api error (status %d): %s", listResp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var containers []struct {
-		ID string `json:"Id"`
+		ID    string   `json:"Id"`
+		Names []string `json:"Names"`
 	}
 	if err := json.NewDecoder(listResp.Body).Decode(&containers); err != nil {
 		return "", "", fmt.Errorf("docker list decode: %w", err)
 	}
-	if len(containers) == 0 {
-		return "", "", fmt.Errorf("no container found for uuid %s", uuid)
+
+	// Try to find an exact or prefix match in the names
+	for _, c := range containers {
+		for _, name := range c.Names {
+			// Docker names start with /
+			trimmed := strings.TrimPrefix(name, "/")
+			if trimmed == uuid || strings.HasPrefix(trimmed, uuid+"-") || strings.HasPrefix(trimmed, uuid) {
+				return c.ID, base, nil
+			}
+		}
 	}
-	return containers[0].ID, base, nil
+
+	if len(containers) > 0 {
+		return containers[0].ID, base, nil
+	}
+
+	return "", "", fmt.Errorf("container not found for uuid %s", uuid)
 }
 
 // dockerContainerLogs fetches the tail of a container's logs via the Docker
@@ -927,12 +949,12 @@ func dockerContainerLogs(ctx context.Context, host, uuid string, lines int) (str
 		base, id, lines)
 	logsResp, err := dockerDo(ctx, http.MethodGet, logsURL, nil, 10*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("docker logs: %w", err)
+		return "", fmt.Errorf("docker logs request: %w", err)
 	}
 	defer logsResp.Body.Close()
 	if logsResp.StatusCode < 200 || logsResp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(logsResp.Body, 512))
-		return "", fmt.Errorf("docker logs http %d: %s", logsResp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("docker logs api error (status %d): %s", logsResp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	raw, err := io.ReadAll(io.LimitReader(logsResp.Body, 8<<20)) // 8 MiB cap
 	if err != nil {
@@ -957,7 +979,7 @@ func dockerDo(ctx context.Context, method, endpoint string, body io.Reader, time
 	resp, err := dockerClient.Do(req)
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("proxy request failed: %w", err)
 	}
 	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
 	return resp, nil
@@ -1028,7 +1050,11 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
 			log.Printf("docker logs failed for %s (host=%s user=%s): %v", res.UUID, res.DockerHost, u.Name, err)
-			w.WriteHeader(http.StatusBadGateway)
+			status := http.StatusBadGateway
+			if strings.Contains(err.Error(), "not found") {
+				status = http.StatusNotFound
+			}
+			w.WriteHeader(status)
 			_ = json.NewEncoder(w).Encode(map[string]any{"logs": "", "error": err.Error()})
 			return
 		}
