@@ -229,6 +229,7 @@ func main() {
 	http.HandleFunc("/status", handleStatus)
 	http.HandleFunc("/envs", handleEnvs)
 	http.HandleFunc("/logs", handleLogs)
+	http.HandleFunc("/stats", handleStats)
 	http.HandleFunc("/coolify-status", handleCoolifyStatus)
 	http.HandleFunc("/favicon.ico", handleFavicon)
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
@@ -918,4 +919,117 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Write(body)
+}
+
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	res, _ := findAndAuthorize(w, r, r.URL.Query().Get("uuid"))
+	if res == nil {
+		return
+	}
+
+	if res.DockerHost == "" {
+		http.Error(w, "metrics require docker_host", http.StatusBadRequest)
+		return
+	}
+
+	base, err := dockerAPIBase(res.DockerHost)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// We need the container ID. We can use the same logic as dockerContainerLogs
+	// but let's keep it simple and just do the list + stats call.
+	filters, _ := json.Marshal(map[string][]string{"name": {res.UUID}})
+	listURL := base + "/containers/json?all=true&filters=" + url.QueryEscape(string(filters))
+	listResp, err := dockerDo(r.Context(), http.MethodGet, listURL, 5*time.Second)
+	if err != nil {
+		http.Error(w, "docker unreachable", http.StatusBadGateway)
+		return
+	}
+	defer listResp.Body.Close()
+
+	var containers []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&containers); err != nil || len(containers) == 0 {
+		http.Error(w, "container not found", http.StatusNotFound)
+		return
+	}
+
+	statsURL := fmt.Sprintf("%s/containers/%s/stats?stream=false", base, containers[0].ID)
+	statsResp, err := dockerDo(r.Context(), http.MethodGet, statsURL, 10*time.Second)
+	if err != nil {
+		http.Error(w, "stats failed", http.StatusBadGateway)
+		return
+	}
+	defer statsResp.Body.Close()
+
+	var ds struct {
+		CPUStats struct {
+			CPUUsage struct {
+				TotalUsage uint64 `json:"total_usage"`
+			} `json:"cpu_usage"`
+			SystemCPUUsage uint64 `json:"system_cpu_usage"`
+			OnlineCPUs     uint64 `json:"online_cpus"`
+		} `json:"cpu_stats"`
+		PreCPUStats struct {
+			CPUUsage struct {
+				TotalUsage uint64 `json:"total_usage"`
+			} `json:"cpu_usage"`
+			SystemCPUUsage uint64 `json:"system_cpu_usage"`
+			OnlineCPUs     uint64 `json:"online_cpus"`
+		} `json:"precpu_stats"`
+		MemoryStats struct {
+			Usage uint64 `json:"usage"`
+			Stats struct {
+				Cache uint64 `json:"cache"`
+			} `json:"stats"`
+			Limit uint64 `json:"limit"`
+		} `json:"memory_stats"`
+		Networks map[string]struct {
+			RxBytes uint64 `json:"rx_bytes"`
+			TxBytes uint64 `json:"tx_bytes"`
+		} `json:"networks"`
+	}
+
+	if err := json.NewDecoder(statsResp.Body).Decode(&ds); err != nil {
+		http.Error(w, "decode failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Calculate CPU
+	cpuDelta := float64(ds.CPUStats.CPUUsage.TotalUsage) - float64(ds.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(ds.CPUStats.SystemCPUUsage) - float64(ds.PreCPUStats.SystemCPUUsage)
+	onlineCPUs := float64(ds.CPUStats.OnlineCPUs)
+	if onlineCPUs == 0 {
+		onlineCPUs = 1
+	}
+
+	cpuPercent := 0.0
+	if systemDelta > 0.0 && cpuDelta > 0.0 {
+		cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
+	}
+
+	// Calculate Memory (Usage - Cache)
+	memUsage := ds.MemoryStats.Usage - ds.MemoryStats.Stats.Cache
+
+	// Calculate Network
+	var rx, tx uint64
+	for _, n := range ds.Networks {
+		rx += n.RxBytes
+		tx += n.TxBytes
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cpu_percent":  cpuPercent,
+		"memory_usage": memUsage,
+		"memory_limit": ds.MemoryStats.Limit,
+		"network_rx":   rx,
+		"network_tx":   tx,
+	})
 }

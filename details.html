@@ -82,6 +82,12 @@
   .tab-btn.active { opacity: 1; border-bottom-color: currentColor; }
   .tab-pane { display: none; }
   .tab-pane.active { display: block; }
+
+  .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+  .metric-card { background: color-mix(in srgb, currentColor 5%, transparent); border: 1px solid color-mix(in srgb, currentColor 10%, transparent); border-radius: 8px; padding: 0.75rem; text-align: center; }
+  .metric-label { font-size: 0.75rem; opacity: 0.6; text-transform: uppercase; margin-bottom: 0.25rem; font-weight: 600; }
+  .metric-value { font-size: 1.1rem; font-weight: 700; font-family: ui-monospace, SFMono-Regular, monospace; }
+  .metric-sub { font-size: 0.7rem; opacity: 0.5; margin-top: 0.2rem; }
 </style>
 </head>
 <body>
@@ -135,6 +141,30 @@
 
   <div id="tab-logs" class="tab-pane">
     {{if or (eq (printf "%s" .Resource.Kind) "applications") .Resource.DockerHost}}
+    
+    {{if .Resource.DockerHost}}
+    <div class="section-title">Container Metrics</div>
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-label">CPU Usage</div>
+        <div class="metric-value" id="metric-cpu">0.00%</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Memory</div>
+        <div class="metric-value" id="metric-mem">0 B</div>
+        <div class="metric-sub" id="metric-mem-limit">Limit: 0 B</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Network Rx</div>
+        <div class="metric-value" id="metric-rx">0 B</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Network Tx</div>
+        <div class="metric-value" id="metric-tx">0 B</div>
+      </div>
+    </div>
+    {{end}}
+
     <div class="section-title">Live Logs</div>
     <div class="log-controls">
       <span class="log-live-dot" id="live-dot"></span>
@@ -292,6 +322,35 @@ document.addEventListener('click', async (e) => {
 });
 
 // Status polling logic (reused from index.html)
+function formatBytes(bytes, decimals = 2) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+async function refreshStats() {
+  if (document.getElementById('tab-logs').classList.contains('active') === false) return;
+  const cpuEl = document.getElementById('metric-cpu');
+  if (!cpuEl) return;
+
+  try {
+    const r = await fetch('/stats?uuid=' + encodeURIComponent(uuid));
+    if (!r.ok) return;
+    const data = await r.json();
+
+    cpuEl.textContent = data.cpu_percent.toFixed(2) + '%';
+    document.getElementById('metric-mem').textContent = formatBytes(data.memory_usage);
+    document.getElementById('metric-mem-limit').textContent = 'Limit: ' + formatBytes(data.memory_limit);
+    document.getElementById('metric-rx').textContent = formatBytes(data.network_rx);
+    document.getElementById('metric-tx').textContent = formatBytes(data.network_tx);
+  } catch (e) {
+    console.error('Metrics fetch failed', e);
+  }
+}
+
 function bucket(status) {
   const head = status.split(':')[0];
   if (head === 'running' || head === 'degraded') return 'up';
@@ -461,7 +520,9 @@ if (liveLogsEl) {
 
 refreshStatus();
 loadEnvs();
+refreshStats();
 setInterval(refreshStatus, 10000);
+setInterval(refreshStats, 5000);
 </script>
 </body>
 </html>
