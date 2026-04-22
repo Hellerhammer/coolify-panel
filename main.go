@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -38,6 +40,11 @@ type Resource struct {
 	Actions       []string     `yaml:"actions"`        // subset of: restart, start, stop
 	EditableEnvs  []string     `yaml:"editable_envs"`  // environment variables allowed to be edited
 	ExposeAllEnvs bool         `yaml:"expose_all_envs"` // if true, all environment variables are editable
+	// Optional Docker host this resource's container runs on, e.g.
+	// "tcp://docker-proxy:2375" or "tcp://192.168.1.50:2375". Intended for
+	// future direct-Docker features; no handler consumes this yet. Leaving
+	// it empty keeps behavior unchanged (everything via the Coolify API).
+	DockerHost string `yaml:"docker_host"`
 }
 
 type Config struct {
@@ -65,6 +72,10 @@ var (
 	// Reused across all outbound calls to Coolify. Per-request deadlines are
 	// applied via context.WithTimeout, not via the client's Timeout field.
 	coolifyClient = &http.Client{Timeout: 30 * time.Second}
+
+	// Used for Docker API calls against a socket-proxy endpoint configured
+	// via Resource.DockerHost. Per-request deadlines via context.
+	dockerClient = &http.Client{Timeout: 30 * time.Second}
 )
 
 // startMapCleanup runs a background loop to prune old entries from the rate
@@ -176,27 +187,17 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Config can come from two places:
-	//   1. The CONFIG_YAML env var (whole yaml contents as a string) — preferred
-	//      in container platforms like Coolify.
-	//   2. A file at CONFIG_PATH (defaults to /config/config.yaml) — useful for
-	//      local development or volume-mounted setups.
-	var data []byte
-	if inline := os.Getenv("CONFIG_YAML"); inline != "" {
-		data = []byte(inline)
-		log.Print("loading config from CONFIG_YAML env var")
-	} else {
-		configPath := os.Getenv("CONFIG_PATH")
-		if configPath == "" {
-			configPath = "/config/config.yaml"
-		}
-		var err error
-		data, err = os.ReadFile(configPath)
-		if err != nil {
-			log.Fatalf("read config %s: %v (set CONFIG_YAML env var or mount a config file)", configPath, err)
-		}
-		log.Printf("loading config from %s", configPath)
+	// Config is loaded from a file at CONFIG_PATH (default /config/config.yaml).
+	// Mount it into the container or point CONFIG_PATH at a local file.
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "/config/config.yaml"
 	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		log.Fatalf("read config %s: %v (mount a config file or set CONFIG_PATH)", configPath, err)
+	}
+	log.Printf("loading config from %s", configPath)
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("parse config: %v", err)
 	}
@@ -723,6 +724,132 @@ func findAndAuthorize(w http.ResponseWriter, r *http.Request, uuid string) (*Res
 	return nil, u
 }
 
+// dockerAPIBase converts a user-supplied DockerHost ("tcp://docker-proxy:2375")
+// into the HTTP base URL the Docker Engine API expects ("http://docker-proxy:2375").
+// Only tcp:// is supported — unix sockets would need a custom Transport and
+// the proxy-over-TCP model is the point of this feature.
+func dockerAPIBase(host string) (string, error) {
+	u, err := url.Parse(host)
+	if err != nil {
+		return "", fmt.Errorf("parse docker_host %q: %w", host, err)
+	}
+	if u.Scheme != "tcp" || u.Host == "" {
+		return "", fmt.Errorf("docker_host %q must be tcp://host:port", host)
+	}
+	return "http://" + u.Host, nil
+}
+
+// dockerContainerLogs fetches the tail of a container's logs via the Docker
+// Engine API, finding the container by Coolify's UUID-prefixed name. Returns
+// a plain-text string suitable for the existing log-view UI.
+func dockerContainerLogs(ctx context.Context, host, uuid string, lines int) (string, error) {
+	base, err := dockerAPIBase(host)
+	if err != nil {
+		return "", err
+	}
+
+	// Find the container: Coolify names containers with the application/
+	// service/database UUID as a prefix, so a name-substring filter finds it.
+	filters, _ := json.Marshal(map[string][]string{"name": {uuid}})
+	listURL := base + "/containers/json?all=true&filters=" + url.QueryEscape(string(filters))
+	listResp, err := dockerDo(ctx, http.MethodGet, listURL, 8*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("docker list: %w", err)
+	}
+	defer listResp.Body.Close()
+	if listResp.StatusCode < 200 || listResp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(listResp.Body, 512))
+		return "", fmt.Errorf("docker list http %d: %s", listResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var containers []struct {
+		ID    string   `json:"Id"`
+		Names []string `json:"Names"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&containers); err != nil {
+		return "", fmt.Errorf("docker list decode: %w", err)
+	}
+	if len(containers) == 0 {
+		return "", fmt.Errorf("no container found for uuid %s", uuid)
+	}
+	if len(containers) > 1 {
+		log.Printf("docker logs: %d containers match uuid %s, using first (%s)", len(containers), uuid, containers[0].ID[:12])
+	}
+
+	// Fetch logs. Non-TTY containers (the default) return a multiplexed
+	// stream with 8-byte frame headers; TTY containers return raw bytes.
+	// Tty flag is on the inspect payload, not the list payload — to avoid
+	// a third round-trip, we always try to demultiplex and fall back to
+	// the raw bytes if the stream doesn't look framed.
+	logsURL := fmt.Sprintf("%s/containers/%s/logs?stdout=1&stderr=1&tail=%d&timestamps=0",
+		base, containers[0].ID, lines)
+	logsResp, err := dockerDo(ctx, http.MethodGet, logsURL, 10*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("docker logs: %w", err)
+	}
+	defer logsResp.Body.Close()
+	if logsResp.StatusCode < 200 || logsResp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(logsResp.Body, 512))
+		return "", fmt.Errorf("docker logs http %d: %s", logsResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	raw, err := io.ReadAll(io.LimitReader(logsResp.Body, 8<<20)) // 8 MiB cap
+	if err != nil {
+		return "", fmt.Errorf("docker logs read: %w", err)
+	}
+	return demuxDockerLogs(raw), nil
+}
+
+// dockerDo issues an authenticated-free GET against the proxy with a context
+// deadline wired up the same way callCoolify does it.
+func dockerDo(ctx context.Context, method, endpoint string, timeout time.Duration) (*http.Response, error) {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	req, err := http.NewRequestWithContext(cctx, method, endpoint, nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := dockerClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// demuxDockerLogs strips Docker's 8-byte multiplex frame headers
+// (stream_type, 0, 0, 0, size_uint32_be) and concatenates the payloads. If
+// the stream doesn't look framed (TTY containers), the raw bytes are
+// returned unchanged.
+func demuxDockerLogs(raw []byte) string {
+	var out strings.Builder
+	i := 0
+	for i < len(raw) {
+		if len(raw)-i < 8 {
+			// Trailing non-framed bytes — treat as raw.
+			out.Write(raw[i:])
+			break
+		}
+		streamType := raw[i]
+		// Valid multiplex stream types are 0 (stdin), 1 (stdout), 2 (stderr).
+		// Anything else means this isn't a framed stream.
+		if streamType > 2 || raw[i+1] != 0 || raw[i+2] != 0 || raw[i+3] != 0 {
+			return string(raw)
+		}
+		size := binary.BigEndian.Uint32(raw[i+4 : i+8])
+		i += 8
+		end := i + int(size)
+		if end > len(raw) {
+			// Truncated frame — write what we have and stop.
+			out.Write(raw[i:])
+			break
+		}
+		out.Write(raw[i:end])
+		i = end
+	}
+	return out.String()
+}
+
 func handleLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
@@ -730,10 +857,6 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	res, u := findAndAuthorize(w, r, r.URL.Query().Get("uuid"))
 	if res == nil {
-		return
-	}
-	if res.Kind != KindApplication {
-		http.Error(w, "logs are only available for applications", http.StatusBadRequest)
 		return
 	}
 
@@ -748,6 +871,29 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	if lines > 1000 {
 		lines = 1000
+	}
+
+	// Docker-socket-proxy path: when docker_host is set on the resource we
+	// pull logs directly from the Docker Engine API. No Coolify fallback —
+	// a misconfigured docker_host surfaces as a visible error rather than
+	// silently hiding logs.
+	if res.DockerHost != "" {
+		logs, err := dockerContainerLogs(r.Context(), res.DockerHost, res.UUID, lines)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			log.Printf("docker logs failed for %s (host=%s user=%s): %v", res.UUID, res.DockerHost, u.Name, err)
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"logs": "", "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"logs": logs})
+		return
+	}
+
+	// Coolify-API fallback: only applications expose a logs endpoint.
+	if res.Kind != KindApplication {
+		http.Error(w, "logs are only available for applications (set docker_host to enable logs for services/databases)", http.StatusBadRequest)
+		return
 	}
 
 	endpoint := fmt.Sprintf("%s/api/v1/applications/%s/logs?lines=%d", cfg.CoolifyURL, res.UUID, lines)

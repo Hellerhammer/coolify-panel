@@ -72,8 +72,24 @@ header names (`Remote-User`, `Remote-Groups`) are compatible.
 ### 5. Deploy via Coolify
 
 Easiest path: add the repo (or a zip) to Coolify as a Docker Compose application.
-Set `COOLIFY_TOKEN` as a secret env var in Coolify's UI. Mount `config.yaml` as a
-persistent file, or commit it to the repo (just never with the token in it).
+Set `COOLIFY_TOKEN` as a secret env var in Coolify's UI. `config.yaml` is mounted
+into the container at `/config/config.yaml` — add a Persistent Storage entry in
+Coolify mapping a host path (or volume) to `/config`, and put `config.yaml`
+there. Never commit the config with the token embedded.
+
+### 5a. Optional: direct Docker log viewing
+
+The bundled `docker-compose.yml` also starts a read-only Docker socket proxy
+([Tecnativa's](https://github.com/Tecnativa/docker-socket-proxy)). Setting
+`docker_host: "tcp://docker-proxy:2375"` on a resource in `config.yaml` makes
+the panel pull logs straight from the Docker Engine API for that resource
+instead of going through Coolify. This is the only way to see logs for
+**services** and **databases** — Coolify's public API has no log endpoint for
+those. For applications, it also works and skips the Coolify round-trip.
+
+Remote hosts work the same way: run a socket proxy on that host and use
+`docker_host: "tcp://<host-ip>:2375"`. Never expose the raw Docker socket
+unauthenticated — the proxy is not optional.
 
 ### 6. Logout with Authentik (forward-auth)
 

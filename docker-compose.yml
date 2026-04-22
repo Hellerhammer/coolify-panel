@@ -10,9 +10,11 @@ services:
       # Internal Docker hostname inside Coolify's network:
       COOLIFY_API_URL: "http://coolify:8080"
       COOLIFY_TOKEN: "${COOLIFY_TOKEN}"
-      # CONFIG_YAML holds the entire panel config as a multiline string.
-      # Set it in Coolify's Environment Variables UI (enable "Is Multiline").
-      CONFIG_YAML: "${CONFIG_YAML}"
+    volumes:
+      # Mount the panel config read-only. In Coolify, add a Persistent Storage
+      # entry mapping a host path (or a named volume) to /config, containing
+      # config.yaml. Local dev: point CONFIG_PATH at a local file instead.
+      - ./config.yaml:/config/config.yaml:ro
     healthcheck:
       test: ["CMD", "/panel", "-healthcheck"]
       interval: 30s
@@ -23,4 +25,31 @@ services:
       # Attach Authentik forward-auth middleware (defined as dynamic config
       # in Coolify: Server -> Proxy -> Dynamic Configurations).
       - "coolify.traefik.middlewares=authentik-auth@file"
+
+  # Tecnativa Docker Socket Proxy — exposes a restricted subset of the Docker
+  # API over TCP so the panel can later talk to Docker without mounting the
+  # raw socket. The panel's Go code does not yet consume this; the service is
+  # here as infrastructure so resources can reference `docker_host:
+  # tcp://docker-proxy:2375` in config.yaml once the feature lands.
+  # Remote hosts (e.g. a Raspberry Pi on the LAN) can be referenced directly
+  # by tcp://IP:2375 in their own resource entry and do not need this proxy.
+  docker-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    environment:
+      # Minimum needed for container start/stop/restart via the Docker API.
+      # Everything else stays at the image default (0 = denied).
+      CONTAINERS: 1
+      POST: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      # The image is HAProxy-based and ships no wget/curl. Use the Docker CLI
+      # against the proxy's own TCP endpoint — the `docker` binary is present
+      # in the container.
+      test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "info"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
  

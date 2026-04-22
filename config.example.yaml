@@ -28,6 +28,14 @@ resources:
     actions: [restart, start, stop]
     expose_all_envs: true
     # editable_envs: ["MY_APP_VAR", "ANOTHER_VAR"]
+    # Optional: Docker host this resource's container lives on. When set,
+    # logs are pulled directly via the Docker Engine API instead of via
+    # the Coolify logs endpoint. This also enables log viewing for
+    # services and databases (Coolify has no log API for those). When
+    # omitted, only applications get logs (via Coolify).
+    #   - Same host as the panel (via bundled socket proxy): "tcp://docker-proxy:2375"
+    #   - Remote host on the LAN (needs its own socket proxy there):  "tcp://192.168.1.50:2375"
+    # docker_host: "tcp://docker-proxy:2375"
 
   - name: "TeamSpeak 6"
     uuid: "xxx-yyy-zzz"
@@ -35,3 +43,4 @@ resources:
     allowed_users: []
     allowed_groups: ["gamers", "admins"]
     actions: [restart]
+    # docker_host: "tcp://192.168.1.50:2375"

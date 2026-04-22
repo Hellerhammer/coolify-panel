@@ -119,7 +119,7 @@
   </div>
   {{end}}
 
-  {{if eq (printf "%s" .Resource.Kind) "applications"}}
+  {{if or (eq (printf "%s" .Resource.Kind) "applications") .Resource.DockerHost}}
   <div class="section-title">Live Logs</div>
   <div class="log-controls">
     <span class="log-live-dot" id="live-dot"></span>
@@ -132,7 +132,7 @@
   <pre class="log-output empty" id="live-logs">Loading…</pre>
   {{else}}
   <div class="section-title">Logs</div>
-  <p class="muted-note">Live logs and deployment logs are only available for applications via the Coolify API — not for services or databases.</p>
+  <p class="muted-note">Live logs are only available for applications via the Coolify API, or when a <code>docker_host</code> is configured for this resource.</p>
   {{end}}
 </div>
 
